@@ -52,12 +52,17 @@ int tc_classifier(struct __sk_buff *skb)
     if ((void *)(ip + 1) > data_end)
         return TC_ACT_OK;
 
+    if (ip->ihl < 5)
+        return TC_ACT_OK;
+
     struct flow_key key = {};
     key.src_ip = ip->saddr;
     key.dst_ip = ip->daddr;
     key.proto  = ip->protocol;
 
     void *l4 = (void *)ip + (ip->ihl * 4);
+    if (l4 > data_end)
+        return TC_ACT_OK;
 
     if (key.proto == IPPROTO_TCP) {
         struct tcphdr *tcp = l4;
