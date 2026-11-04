@@ -1,0 +1,14 @@
+# OpenEdge-MLQoS nftables configuration
+table inet mlqos {
+    chain prerouting {
+        type filter hook prerouting priority mangle; policy accept;
+        ct mark 0x00000010 ip dscp set ef counter
+        ct mark 0x00000020 ip dscp set af41 counter
+        ct mark 0x00000030 ip dscp set cs1 counter
+    }
+
+    chain forward {
+        type filter hook forward priority 0; policy accept;
+        flow add @flowtable_bypass
+    }
+}
