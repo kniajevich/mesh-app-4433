@@ -1,369 +1,269 @@
-use std::collections::HashMap;
-use std::fs;
-use std::io::{Read, Write};
-use std::net::SocketAddr;
-use std::os::unix::io::AsRawFd;
-use std::path::Path;
-use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
+use arc_swap::ArcSwap;
+use sha2::{Digest, Sha256};
+use tokio::time;
 
-use anyhow::{Context, Result};
-use clap::Parser;
-use nix::sys::signal::{self, Signal};
-use nix::unistd::Pid;
-use ringbuf::RingBuffer;
-use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info, warn};
-use tracing_subscriber::EnvFilter;
+// ============================================================================
+// 1. MLP INT8 Pure Rust Engine (Топология: 16 -> 32 -> 16 -> 4)
+// ============================================================================
+// Точный размер бинарника в байтах:
+// W1: 32 * 16 = 512
+// B1: 32 * 4  = 128
+// Scale1: 4
+// W2: 16 * 32 = 512
+// B2: 16 * 4  = 64
+// Scale2: 4
+// W3: 4 * 16  = 64
+// B3: 4 * 4   = 16
+// Scale3: 4
+// Итого: 512 + 128 + 4 + 512 + 64 + 4 + 64 + 16 + 4 = 1308 байт
+pub const MODEL_BIN_SIZE: usize = 1308;
 
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Cli {
-    #[arg(short, long, default_value = "/etc/openedge-mlqos/config.toml")]
-    config: String,
+#[derive(Clone, Debug)]
+pub struct Int8Mlp {
+    pub w1: [[i8; 16]; 32],
+    pub b1: [i32; 32],
+    pub scale1: f32,
 
-    #[arg(short, long, default_value = "eth0")]
-    interface: String,
+    pub w2: [[i8; 32]; 16],
+    pub b2: [i32; 16],
+    pub scale2: f32,
 
-    #[arg(short, long, default_value = "8192")]
-    ringbuf_size: usize,
-
-    #[arg(short, long, default_value = "100")]
-    batch_size: usize,
+    pub w3: [[i8; 16]; 4],
+    pub b3: [i32; 4],
+    pub scale3: f32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Config {
-    model_path: String,
-    nftables_chain: String,
-    dscp_map: HashMap<String, u8>,
-    learning_rate: f32,
-    min_confidence: f32,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct PacketFeatures {
-    pub src_ip: u32,
-    pub dst_ip: u32,
-    pub src_port: u16,
-    pub dst_port: u16,
-    pub protocol: u8,
-    pub packet_size: u16,
-    pub inter_arrival_time: u32,
-    pub flow_id: u64,
-    pub timestamp_ns: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ClassificationResult {
-    pub class_id: u8,
-    pub confidence: f32,
-    pub flow_id: u64,
-}
-
-struct SmartQosd {
-    config: Config,
-    ringbuf: RingBuffer<PacketFeatures>,
-    model: Mutex<SimpleMLModel>,
-    nftables: NftablesManager,
-    running: Arc<AtomicBool>,
-    stats: Arc<Stats>,
-}
-
-#[derive(Debug, Default)]
-struct Stats {
-    packets_processed: AtomicU64,
-    classifications_made: AtomicU64,
-    nftables_updates: AtomicU64,
-    errors: AtomicU64,
-    last_update_time: Mutex<Instant>,
-}
-
-struct SimpleMLModel {
-    weights: Vec<f32>,
-    bias: f32,
-    version: u32,
-}
-
-impl SimpleMLModel {
-    fn new() -> Self {
-        Self {
-            weights: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
-            bias: 0.0,
-            version: 1,
+impl Int8Mlp {
+    /// Загрузка весов из плоского бинарного буфера
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
+        if bytes.len() != MODEL_BIN_SIZE {
+            return Err("Invalid model.bin size: byte count mismatch");
         }
-    }
 
-    fn load_from_file(&mut self, path: &str) -> Result<()> {
-        let data = fs::read(path).with_context(|| format!("Failed to read model file: {}", path))?;
-        // Simplified deserialization for demonstration
-        // In production, use a proper serialization format
-        if data.len() >= 4 {
-            self.version = u32::from_le_bytes(data[0..4].try_into().unwrap());
-        }
-        info!("Loaded ML model version {} from {}", self.version, path);
-        Ok(())
-    }
+        let mut offset = 0;
 
-    fn predict(&self, features: &PacketFeatures) -> ClassificationResult {
-        let mut score = self.bias;
-        let feature_values = [
-            (features.src_port as f32) / 65535.0,
-            (features.dst_port as f32) / 65535.0,
-            (features.protocol as f32) / 255.0,
-            (features.packet_size as f32) / 65535.0,
-            (features.inter_arrival_time as f32) / 1_000_000.0,
-            ((features.src_ip & 0xFF) as f32) / 255.0,
-            ((features.dst_ip & 0xFF) as f32) / 255.0,
-            1.0,
-        ];
-
-        for (i, &val) in feature_values.iter().enumerate() {
-            if i < self.weights.len() {
-                score += self.weights[i] * val;
+        let mut read_w1 = [[0i8; 16]; 32];
+        for row in &mut read_w1 {
+            for val in row {
+                *val = bytes[offset] as i8;
+                offset += 1;
             }
         }
 
-        // Simple sigmoid activation
-        let confidence = 1.0 / (1.0 + (-score).exp());
-        let class_id = if confidence > 0.5 { 1 } else { 0 };
-
-        ClassificationResult {
-            class_id,
-            confidence: confidence as f32,
-            flow_id: features.flow_id,
+        let mut read_b1 = [0i32; 32];
+        for val in &mut read_b1 {
+            *val = i32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            offset += 4;
         }
-    }
+        let scale1 = f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        offset += 4;
 
-    fn update(&mut self, features: &PacketFeatures, label: u8) {
-        let prediction = self.predict(features);
-        let error = (label as f32) - prediction.confidence;
-        
-        let feature_values = [
-            (features.src_port as f32) / 65535.0,
-            (features.dst_port as f32) / 65535.0,
-            (features.protocol as f32) / 255.0,
-            (features.packet_size as f32) / 65535.0,
-            (features.inter_arrival_time as f32) / 1_000_000.0,
-            ((features.src_ip & 0xFF) as f32) / 255.0,
-            ((features.dst_ip & 0xFF) as f32) / 255.0,
-            1.0,
-        ];
-
-        let lr = 0.01;
-        for (i, &val) in feature_values.iter().enumerate() {
-            if i < self.weights.len() {
-                self.weights[i] += lr * error * val;
+        let mut read_w2 = [[0i8; 32]; 16];
+        for row in &mut read_w2 {
+            for val in row {
+                *val = bytes[offset] as i8;
+                offset += 1;
             }
         }
-        self.bias += lr * error;
-    }
-}
 
-struct NftablesManager {
-    chain_name: String,
-    dscp_map: HashMap<String, u8>,
-}
-
-impl NftablesManager {
-    fn new(chain_name: String, dscp_map: HashMap<String, u8>) -> Self {
-        Self {
-            chain_name,
-            dscp_map,
+        let mut read_b2 = [0i32; 16];
+        for val in &mut read_b2 {
+            *val = i32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            offset += 4;
         }
-    }
+        let scale2 = f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        offset += 4;
 
-    fn apply_dscp_tag(&self, flow_id: u64, class_id: u8) -> Result<()> {
-        let dscp_value = self.dscp_map.get(&class_id.to_string())
-            .copied()
-            .unwrap_or(0);
-        
-        let dscp_hex = format!("{:02x}", dscp_value);
-        
-        // Use nftables command to add/update rule
-        let cmd = format!(
-            "nft add rule inet filter {} meta mark 0x{:08x} dscp set {}",
-            self.chain_name,
-            flow_id as u32,
-            dscp_hex
-        );
-        
-        debug!("Applying DSCP tag: {}", cmd);
-        
-        let output = Command::new("nft")
-            .args(cmd.split_whitespace())
-            .output()
-            .context("Failed to execute nft command")?;
-        
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("nft command failed: {}", stderr));
+        let mut read_w3 = [[0i8; 16]; 4];
+        for row in &mut read_w3 {
+            for val in row {
+                *val = bytes[offset] as i8;
+                offset += 1;
+            }
         }
-        
-        Ok(())
-    }
 
-    fn flush_rules(&self) -> Result<()> {
-        let cmd = format!("nft flush chain inet filter {}", self.chain_name);
-        let output = Command::new("nft")
-            .args(cmd.split_whitespace())
-            .output()
-            .context("Failed to execute nft flush command")?;
-        
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("nft flush failed: {}", stderr));
+        let mut read_b3 = [0i32; 4];
+        for val in &mut read_b3 {
+            *val = i32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            offset += 4;
         }
-        
-        Ok(())
-    }
-}
+        let scale3 = f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
 
-impl SmartQosd {
-    fn new(config: Config, ringbuf: RingBuffer<PacketFeatures>) -> Result<Self> {
-        let model = Mutex::new(SimpleMLModel::new());
-        let nftables = NftablesManager::new(
-            config.nftables_chain.clone(),
-            config.dscp_map.clone(),
-        );
-        
         Ok(Self {
-            config,
-            ringbuf,
-            model,
-            nftables,
-            running: Arc::new(AtomicBool::new(true)),
-            stats: Arc::new(Stats::default()),
+            w1: read_w1,
+            b1: read_b1,
+            scale1,
+            w2: read_w2,
+            b2: read_b2,
+            scale2,
+            w3: read_w3,
+            b3: read_b3,
+            scale3,
         })
     }
 
-    fn setup_signal_handlers(&self) -> Result<()> {
-        // Install SIGHUP handler for config reload
-        let running = Arc::clone(&self.running);
-        
-        signal::signal(Signal::SIGHUP, move |_| {
-            info!("Received SIGHUP, reloading configuration...");
-            // In production, this would trigger a config reload
-            // For now, just log it
-        })?;
-        
-        signal::signal(Signal::SIGTERM, move |_| {
-            info!("Received SIGTERM, shutting down...");
-            running.store(false, Ordering::SeqCst);
-        })?;
-        
-        signal::signal(Signal::SIGINT, move |_| {
-            info!("Received SIGINT, shutting down...");
-            running.store(false, Ordering::SeqCst);
-        })?;
-        
-        Ok(())
+    /// Безопасные дефолтные веса для холодного старта без сети
+    pub fn fallback() -> Self {
+        Self {
+            w1: [[1i8; 16]; 32],
+            b1: [0; 32],
+            scale1: 1.0,
+            w2: [[1i8; 32]; 16],
+            b2: [0; 16],
+            scale2: 1.0,
+            w3: [[1i8; 16]; 4],
+            b3: [0; 4],
+            scale3: 1.0,
+        }
     }
 
-    fn process_batch(&mut self, batch: Vec<PacketFeatures>) -> Result<()> {
-        let mut classifications = Vec::with_capacity(batch.len());
-        
-        for features in &batch {
-            let model = self.model.lock().unwrap();
-            let result = model.predict(features);
-            classifications.push((features.clone(), result));
-        }
-        
-        for (features, result) in &classifications {
-            if result.confidence >= self.config.min_confidence {
-                if let Err(e) = self.nftables.apply_dscp_tag(result.flow_id, result.class_id) {
-                    warn!("Failed to apply DSCP tag for flow {}: {}", result.flow_id, e);
-                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    self.stats.nftables_updates.fetch_add(1, Ordering::Relaxed);
-                }
+    /// Zero-allocation прямой проход: 16 признаков -> 4 логита классов QoS
+    #[inline(always)]
+    pub fn forward(&self, input: &[i8; 16]) -> [i32; 4] {
+        // Слой 1: 16 -> 32 с активацией ReLU
+        let mut l1_out = [0i8; 32];
+        for i in 0..32 {
+            let mut acc = self.b1[i];
+            for j in 0..16 {
+                acc += (self.w1[i][j] as i32) * (input[j] as i32);
             }
-            
-            // Update model with new data (online learning)
-            let mut model = self.model.lock().unwrap();
-            model.update(features, result.class_id);
+            // ReLU + реквантование в i8
+            let val = acc.max(0);
+            l1_out[i] = (val / 128).clamp(0, 127) as i8;
         }
-        
-        self.stats.packets_processed.fetch_add(batch.len() as u64, Ordering::Relaxed);
-        self.stats.classifications_made.fetch_add(batch.len() as u64, Ordering::Relaxed);
-        
-        Ok(())
+
+        // Слой 2: 32 -> 16 с активацией ReLU
+        let mut l2_out = [0i8; 16];
+        for i in 0..16 {
+            let mut acc = self.b2[i];
+            for j in 0..32 {
+                acc += (self.w2[i][j] as i32) * (l1_out[j] as i32);
+            }
+            let val = acc.max(0);
+            l2_out[i] = (val / 128).clamp(0, 127) as i8;
+        }
+
+        // Слой 3: 16 -> 4 (Линейные выходные логиты без ReLU)
+        let mut l3_out = [0i32; 4];
+        for i in 0..4 {
+            let mut acc = self.b3[i];
+            for j in 0..16 {
+                acc += (self.w3[i][j] as i32) * (l2_out[j] as i32);
+            }
+            l3_out[i] = acc;
+        }
+
+        l3_out
     }
 
-    fn run(&mut self) -> Result<()> {
-        info!("Starting smart-qosd daemon");
-        
-        self.setup_signal_handlers()?;
-        
-        let mut batch = Vec::with_capacity(self.config.min_confidence as usize * 100);
-        let mut last_stats_update = Instant::now();
-        
-        while self.running.load(Ordering::SeqCst) {
-            // Read from ring buffer
-            match self.ringbuf.read() {
-                Ok(Some(features)) => {
-                    batch.push(features);
-                    
-                    if batch.len() >= 100 {
-                        if let Err(e) = self.process_batch(std::mem::take(&mut batch)) {
-                            error!("Failed to process batch: {}", e);
-                            self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-                Ok(None) => {
-                    // No data available, sleep briefly
-                    thread::sleep(Duration::from_millis(1));
-                }
-                Err(e) => {
-                    error!("Error reading from ring buffer: {}", e);
-                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                    thread::sleep(Duration::from_millis(10));
-                }
-            }
-            
-            // Periodic stats logging
-            if last_stats_update.elapsed() > Duration::from_secs(10) {
-                let stats = &self.stats;
-                info!(
-                    "Stats: packets={}, classifications={}, nft_updates={}, errors={}",
-                    stats.packets_processed.load(Ordering::Relaxed),
-                    stats.classifications_made.load(Ordering::Relaxed),
-                    stats.nftables_updates.load(Ordering::Relaxed),
-                    stats.errors.load(Ordering::Relaxed)
-                );
-                last_stats_update = Instant::now();
+    /// Возвращает индекс класса с наивысшим приоритетом:
+    /// 0: Gaming / EF
+    /// 1: Streaming / AF41
+    /// 2: Web / Best Effort
+    /// 3: Bulk / CS1
+    #[inline(always)]
+    pub fn classify(&self, input: &[i8; 16]) -> u8 {
+        let logits = self.forward(input);
+        let mut max_idx = 0;
+        let mut max_val = logits[0];
+        for (i, &val) in logits.iter().enumerate().skip(1) {
+            if val > max_val {
+                max_val = val;
+                max_idx = i;
             }
         }
-        
-        // Process remaining batch
-        if !batch.is_empty() {
-            if let Err(e) = self.process_batch(batch) {
-                error!("Failed to process final batch: {}", e);
-            }
-        }
-        
-        info!("smart-qosd daemon stopped");
-        Ok(())
+        max_idx as u8
     }
 }
 
-fn load_config(path: &str) -> Result<Config> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read config file: {}", path))?;
-    
-    let config: Config = toml::from_str(&content)
-        .with_context(|| "Failed to parse TOML config")?;
-    
-    info!("Loaded configuration from {}", path);
-    Ok(config)
+// ============================================================================
+// 2. Фоновый сервис безопасного обновления весов
+// ============================================================================
+async fn spawn_model_updater(active_model: Arc<ArcSwap<Int8Mlp>>, repo: String) {
+    let sha_url = format!("https://github.com/{}/releases/download/latest/model.sha256", repo);
+    let bin_url = format!("https://github.com/{}/releases/download/latest/model.bin", repo);
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .user_agent("smart-qosd-updater")
+        .build()
+        .unwrap_or_default();
+
+    let mut current_sha = String::new();
+    let mut interval = time::interval(Duration::from_secs(12 * 3600));
+
+    tokio::spawn(async move {
+        loop {
+            interval.tick().await;
+
+            // 1. Проверяем контрольную сумму
+            let sha_resp = match client.get(&sha_url).send().await {
+                Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
+                _ => continue,
+            };
+
+            let remote_sha = sha_resp.split_whitespace().next().unwrap_or("").to_lowercase();
+            if remote_sha.is_empty() || remote_sha == current_sha {
+                continue;
+            }
+
+            // 2. Скачиваем бинарник весов
+            let bin_resp = match client.get(&bin_url).send().await {
+                Ok(r) if r.status().is_success() => match r.bytes().await {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                },
+                _ => continue,
+            };
+
+            // 3. Строгая валидация размера (ровно 1308 байт)
+            if bin_resp.len() != MODEL_BIN_SIZE {
+                eprintln!("[Model Update] Rejected: size mismatch (got {}, expected {})", bin_resp.len(), MODEL_BIN_SIZE);
+                continue;
+            }
+
+            // 4. Проверка SHA256
+            let mut hasher = Sha256::new();
+            hasher.update(&bin_resp);
+            let calculated_sha = format!("{:x}", hasher.finalize());
+
+            if calculated_sha != remote_sha {
+                eprintln!("[Model Update] Rejected: SHA256 checksum mismatch");
+                continue;
+            }
+
+            // 5. Парсинг и атомарная подмена указателя в памяти
+            if let Ok(new_mlp) = Int8Mlp::from_bytes(&bin_resp) {
+                active_model.store(Arc::new(new_mlp));
+                current_sha = remote_sha;
+                println!("[Model Update] Successfully applied new INT8 weights (SHA: {})", current_sha);
+            }
+        }
+    });
 }
 
-fn create_ringbuf(interface: &str, size: usize) -> Result<RingBuffer<PacketFeatures>> {
-    // In production, this would create a BPF ring buffer
-    // For demonstration, we use a mock implementation
-    info!("Creating ring buffer for interface {} with
+// ============================================================================
+// 3. Точка входа демона
+// ============================================================================
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("Starting smart-qosd with INT8 MLP classification engine...");
+
+    // Инициализация fallback-модели в памяти
+    let initial_model = Arc::new(ArcSwap::from_pointee(Int8Mlp::fallback()));
+
+    // Запуск фонового автообновления
+    spawn_model_updater(initial_model.clone(), "kniajevich/mesh-app-4433".to_string()).await;
+
+    // Демонстрационный проверочный прогон
+    let sample_features: [i8; 16] = [40, 6, 2, 0, 15, 3, 12, 8, 0, 1, 4, 10, 0, 0, 5, 2];
+    let class_id = initial_model.load().classify(&sample_features);
+    println!("Engine booted. Test classification verdict: class {}", class_id);
+
+    // Главный цикл обработки событий eBPF
+    tokio::signal::ctrl_c().await?;
+    println!("Shutting down smart-qosd...");
+    Ok(())
+}
