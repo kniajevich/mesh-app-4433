@@ -1,9 +1,12 @@
 name: OpenWrt eBPF & Rust aarch64 musl CI
+
 on:
   push:
     branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -14,7 +17,7 @@ jobs:
       - name: Install Toolchain, bpftool and libbpf
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libelf-dev libbpf-dev linux-tools-common linux-tools-generic bpftool gcc-aarch64-linux-gnu
+          sudo apt-get install -y clang llvm libelf-dev libbpf-dev bpftool gcc-aarch64-linux-gnu musl-tools
 
       - name: Generate vmlinux.h from Host BTF
         run: |
@@ -24,7 +27,7 @@ jobs:
             echo -e "#ifndef __VMLINUX_H__\n#define __VMLINUX_H__\ntypedef unsigned char __u8;\ntypedef unsigned short __u16;\ntypedef unsigned int __u32;\ntypedef unsigned long long __u64;\n#endif" > ebpf/vmlinux.h
           fi
 
-      - name: Verify eBPF Bytecode Compilation
+      - name: Compile eBPF Bytecode
         run: |
           clang -g -O2 -target bpf -D__TARGET_ARCH_arm64 \
             -Iebpf \
@@ -37,6 +40,21 @@ jobs:
         with:
           targets: aarch64-unknown-linux-musl
 
-      - name: Cross-compile smart-qosd
+      - name: Build smart-qosd binary (musl static)
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
         run: |
-          cargo check --target aarch64-unknown-linux-musl --manifest-path Cargo.toml || echo "Checked syntax"
+          cargo build --release --target aarch64-unknown-linux-musl
+          cp target/aarch64-unknown-linux-musl/release/smart-qosd ./smart-qosd
+
+      - name: Attach binaries to latest release
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main'
+        with:
+          tag_name: latest
+          files: |
+            smart-qosd
+            ebpf/filter.bpf.o
+            rules/mlqos.nft
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
