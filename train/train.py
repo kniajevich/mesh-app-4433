@@ -26,17 +26,17 @@ def export_model():
 
     blob = bytearray()
 
-    # Слой 1: 32x16 (512B) + 32x4 (128B) + scale (4B) = 644B
+    # Слой 1
     blob.extend(w1.tobytes())
     blob.extend(b1.tobytes())
     blob.extend(struct.pack('<f', scale1))
 
-    # Слой 2: 16x32 (512B) + 16x4 (64B) + scale (4B) = 580B
+    # Слой 2
     blob.extend(w2.tobytes())
     blob.extend(b2.tobytes())
     blob.extend(struct.pack('<f', scale2))
 
-    # Слой 3: 4x16 (64B) + 4x4 (16B) + scale (4B) = 84B
+    # Слой 3
     blob.extend(w3.tobytes())
     blob.extend(b3.tobytes())
     blob.extend(struct.pack('<f', scale3))
