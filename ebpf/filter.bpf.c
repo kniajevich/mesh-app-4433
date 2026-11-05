@@ -34,7 +34,7 @@ int tc_classify(struct __sk_buff *skb) {
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
 
-    // Проверка заголовка Ethernet
+    // Проверка Ethernet заголовка
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
         return TC_ACT_OK;
@@ -42,12 +42,12 @@ int tc_classify(struct __sk_buff *skb) {
     if (bpf_ntohs(eth->h_proto) != ETH_P_IP)
         return TC_ACT_OK;
 
-    // Проверка базового IPv4 заголовка
+    // Проверка IPv4 заголовка
     struct iphdr *ip = (void *)(eth + 1);
     if ((void *)(ip + 1) > data_end)
         return TC_ACT_OK;
 
-    // Защита от malformed пакетов: IHL должна быть не менее 5 (20 байт)
+    // Защита от malformed пакетов: IHL должна быть не менее 5
     if (ip->ihl < 5)
         return TC_ACT_OK;
 
@@ -62,14 +62,14 @@ int tc_classify(struct __sk_buff *skb) {
         struct tcphdr *tcp = l4_hdr;
         if ((void *)(tcp + 1) > data_end)
             return TC_ACT_OK;
-        // Приведение сетевого порядка байт (Big-Endian) в Host-Endian
+        // Big-Endian в Host-Endian
         key.src_port = bpf_ntohs(tcp->source);
         key.dst_port = bpf_ntohs(tcp->dest);
     } else if (ip->protocol == IPPROTO_UDP) {
         struct udphdr *udp = l4_hdr;
         if ((void *)(udp + 1) > data_end)
             return TC_ACT_OK;
-        // Приведение сетевого порядка байт (Big-Endian) в Host-Endian
+        // Big-Endian в Host-Endian
         key.src_port = bpf_ntohs(udp->source);
         key.dst_port = bpf_ntohs(udp->dest);
     } else {
@@ -78,7 +78,7 @@ int tc_classify(struct __sk_buff *skb) {
 
     struct flow_metrics *metric = bpf_map_lookup_elem(&flow_table, &key);
     if (metric) {
-        // Записываем класс QoS строго в старшие 8 бит skb->mark
+        // Запись класса strictly в верхний байт без затирания NAT/маршрутных меток fw4
         __u32 current_mark = skb->mark & ~QOS_MARK_MASK;
         skb->mark = current_mark | ((__u32)metric->class_id << QOS_MARK_SHIFT);
     }
