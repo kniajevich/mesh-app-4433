@@ -1,14 +1,16 @@
-# OpenEdge-MLQoS nftables configuration
 table inet mlqos {
     chain prerouting {
         type filter hook prerouting priority mangle; policy accept;
-        ct mark 0x00000010 ip dscp set ef counter
-        ct mark 0x00000020 ip dscp set af41 counter
-        ct mark 0x00000030 ip dscp set cs1 counter
+
+        # Читаем строго старший байт skb->mark (битовая маска 0xff000000)
+        # Это предотвращает конфликт с системными метками OpenWrt fw4 (NAT/Routing)
+        meta mark & 0xff000000 == 0x00000000 ip dscp set cs0
+        meta mark & 0xff000000 == 0x01000000 ip dscp set af41
+        meta mark & 0xff000000 == 0x02000000 ip dscp set cs1
+        meta mark & 0xff000000 == 0x03000000 ip dscp set ef
     }
 
-    chain forward {
-        type filter hook forward priority 0; policy accept;
-        flow add @flowtable_bypass
+    chain postrouting {
+        type filter hook postrouting priority mangle; policy accept;
     }
 }
