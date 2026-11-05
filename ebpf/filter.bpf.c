@@ -5,16 +5,13 @@
 #define TC_ACT_OK 0
 #define ETH_P_IP 0x0800
 
-#define QOS_MARK_MASK 0xFF000000
-#define QOS_MARK_SHIFT 24
-
 struct flow_key {
     __u32 src_ip;
     __u32 dst_ip;
     __u16 src_port;
     __u16 dst_port;
     __u8  protocol;
-    __u8  pad[3];
+    __u8  _pad[3];
 };
 
 struct flow_metrics {
@@ -25,8 +22,9 @@ struct flow_metrics {
     __u64 last_time;
 };
 
+// Заменено на LRU_HASH: ядро автоматически вытесняет неактивные сессии при 65k+ соединений
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
     __type(key, struct flow_key);
     __type(value, struct flow_metrics);
@@ -42,31 +40,26 @@ int tc_classify(struct __sk_buff *skb) {
     if ((void *)(eth + 1) > data_end)
         return TC_ACT_OK;
 
-    if (bpf_ntohs(eth->h_proto) != ETH_P_IP)
+    if (eth->h_proto != bpf_htons(ETH_P_IP))
         return TC_ACT_OK;
 
     struct iphdr *ip = (void *)(eth + 1);
     if ((void *)(ip + 1) > data_end)
         return TC_ACT_OK;
 
-    if (ip->ihl < 5)
-        return TC_ACT_OK;
-
-    struct flow_key key = {0};
+    struct flow_key key = {};
     key.src_ip = ip->saddr;
     key.dst_ip = ip->daddr;
     key.protocol = ip->protocol;
 
-    void *l4_hdr = (void *)ip + (ip->ihl * 4);
-
     if (ip->protocol == IPPROTO_TCP) {
-        struct tcphdr *tcp = l4_hdr;
+        struct tcphdr *tcp = (void *)((unsigned char *)ip + (ip->ihl * 4));
         if ((void *)(tcp + 1) > data_end)
             return TC_ACT_OK;
         key.src_port = bpf_ntohs(tcp->source);
         key.dst_port = bpf_ntohs(tcp->dest);
     } else if (ip->protocol == IPPROTO_UDP) {
-        struct udphdr *udp = l4_hdr;
+        struct udphdr *udp = (void *)((unsigned char *)ip + (ip->ihl * 4));
         if ((void *)(udp + 1) > data_end)
             return TC_ACT_OK;
         key.src_port = bpf_ntohs(udp->source);
@@ -75,33 +68,26 @@ int tc_classify(struct __sk_buff *skb) {
         return TC_ACT_OK;
     }
 
-    __u64 now = bpf_ktime_get_ns();
-    __u32 pkt_len = skb->len;
-
     struct flow_metrics *metric = bpf_map_lookup_elem(&flow_table, &key);
-    if (metric) {
-        if (metric->classified) {
-            __u32 mark = skb->mark;
-            mark &= ~QOS_MARK_MASK;
-            mark |= ((__u32)metric->class_id << QOS_MARK_SHIFT);
+    __u64 now = bpf_ktime_get_ns();
 
-            /* Принудительная 32-битная атомарная запись без разбивки на байты */
-            asm volatile("" : "+r"(mark));
-            skb->mark = mark;
-        } else {
-            metric->pkt_count++;
-            metric->last_len = pkt_len;
-            metric->last_time = now;
-        }
+    if (!metric) {
+        struct flow_metrics new_metric = {};
+        new_metric.class_id = 0;
+        new_metric.classified = 0;
+        new_metric.pkt_count = 1;
+        new_metric.last_len = skb->len;
+        new_metric.last_time = now;
+        bpf_map_update_elem(&flow_table, &key, &new_metric, BPF_NOEXIST);
     } else {
-        struct flow_metrics init_m = {
-            .class_id = 2,
-            .classified = 0,
-            .pkt_count = 1,
-            .last_len = pkt_len,
-            .last_time = now
-        };
-        bpf_map_update_elem(&flow_table, &key, &init_m, BPF_ANY);
+        if (metric->pkt_count < 65535)
+            metric->pkt_count++;
+        metric->last_len = skb->len;
+        metric->last_time = now;
+
+        if (metric->classified) {
+            skb->mark = ((__u32)metric->class_id << 24) | (skb->mark & 0x00FFFFFF);
+        }
     }
 
     return TC_ACT_OK;
