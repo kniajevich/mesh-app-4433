@@ -2,20 +2,23 @@
 set -e
 
 HUB_URL="https://vexon-cloud.goldman-ao.workers.dev"
+REPO_RAW="https://raw.githubusercontent.com/kniajevich/vexon/main"
 INSTALL_DIR="/opt/vexon"
 SERVICE_FILE="/etc/init.d/vexon"
 
-echo "[VEXON] Installing Vexon Edge Agent..."
+echo "[VEXON] Installing Autonomous Edge Agent with Auto-Update..."
 mkdir -p "$INSTALL_DIR"
 
-# 1. Записываем автономный POSIX-агент
+# 1. Generate standalone POSIX agent with self-update logic
 cat << 'EOF' > "${INSTALL_DIR}/sync_agent.sh"
 #!/bin/sh
 
 HUB_URL="${VEXON_HUB_URL:-https://vexon-cloud.goldman-ao.workers.dev}"
+REPO_RAW="https://raw.githubusercontent.com/kniajevich/vexon/main"
 NODE_ID="${VEXON_NODE_ID:-$(cat /proc/sys/kernel/hostname 2>/dev/null || hostname 2>/dev/null || echo "edge-node")}"
 SYNC_INTERVAL="${VEXON_SYNC_INTERVAL:-1800}"
 STATE_FILE="${VEXON_STATE_FILE:-/opt/vexon/network_topology.json}"
+SELF_PATH="/opt/vexon/sync_agent.sh"
 
 send_heartbeat() {
     PAYLOAD="{\"node_id\": \"$NODE_ID\", \"status\": \"online\", \"hostname\": \"$NODE_ID\", \"timestamp\": $(date +%s)}"
@@ -28,16 +31,28 @@ sync_topology() {
     curl -m 10 --connect-timeout 5 -s -k "${HUB_URL}/api/topology" -o "$STATE_FILE" >/dev/null 2>&1 || true
 }
 
+check_self_update() {
+    TMP_INSTALL="/tmp/vexon_install_latest.sh"
+    if curl -m 15 --connect-timeout 5 -s -k "${REPO_RAW}/install.sh" -o "$TMP_INSTALL"; then
+        if head -n 1 "$TMP_INSTALL" | grep -q '#!/bin/sh'; then
+            sh "$TMP_INSTALL" >/dev/null 2>&1 &
+            exit 0
+        fi
+        rm -f "$TMP_INSTALL"
+    fi
+}
+
 while true; do
     send_heartbeat
     sync_topology
+    check_self_update
     sleep "$SYNC_INTERVAL"
 done
 EOF
 
 chmod +x "${INSTALL_DIR}/sync_agent.sh"
 
-# 2. Настраиваем системную службу procd
+# 2. Configure procd service
 cat << 'EOF' > "$SERVICE_FILE"
 #!/bin/sh /etc/rc.common
 
@@ -59,4 +74,4 @@ chmod +x "$SERVICE_FILE"
 "$SERVICE_FILE" enable
 "$SERVICE_FILE" restart
 
-echo "[VEXON] Done! Agent installed and started."
+echo "[VEXON] Agent operational! Self-updating loop is active."
