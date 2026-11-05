@@ -21,7 +21,7 @@ Vexon implements an intelligent, low-latency traffic classification pipeline wit
 - **Target Architecture:** ARM64 (aarch64-unknown-linux-musl) / MediaTek MT7981
 - **Classification Topology:** MLP 16 -> 32 -> 16 -> 4 (ReLU activation)
 - **Model Footprint:** Exactly 1308 bytes
-- **Flow Table:** Hardware-backed LRU hash map (65,536 entries)
+- **Flow Hashing:** Fibonacci Multiplicative Hashing (0x9E3779B9) & LRU eviction
 - **Memory Footprint:** < 4 MB RSS in user-space
 - **QoS Classes:** 0: Gaming/Voice (EF) | 1: Streaming (AF41) | 2: Web (CS0) | 3: Bulk (CS1)
 
@@ -41,7 +41,7 @@ Vexon implements an intelligent, low-latency traffic classification pipeline wit
 
 ### Deployment on OpenWrt / ImmortalWrt
 
-**One-Line Installation:**
+**One-Line Installation:**  
 Run the autonomous installer directly on your router:
 
 `sh -c "$(curl -fsSL https://raw.githubusercontent.com/kniajevich/vexon/main/install.sh || wget --no-check-certificate -qO- https://raw.githubusercontent.com/kniajevich/vexon/main/install.sh)"`
@@ -53,27 +53,6 @@ Run the autonomous installer directly on your router:
   `tc -s filter show dev br-lan ingress`
 - Monitor runtime QoS daemon telemetry:  
   `logread -e vexond`
-
-### Deployment on OpenWrt / ImmortalWrt
-
-**1. Release Artifacts & Source:**  
-Direct binaries and assets are available at [Vexon Latest Release](https://github.com/kniajevich/vexon/releases/tag/latest).
-
-To fetch directly on the router:  
-`mkdir -p /opt/vexon && cd /opt/vexon`  
-`wget -qO vexond https://github.com/kniajevich/vexon/releases/download/latest/vexond`  
-`wget -qO filter.bpf.o https://github.com/kniajevich/vexon/releases/download/latest/filter.bpf.o`  
-`wget -qO model.bin https://github.com/kniajevich/vexon/releases/download/latest/model.bin`  
-`wget -qO mlqos.nft https://github.com/kniajevich/vexon/releases/download/latest/mlqos.nft`  
-`wget -qO SHA256SUMS https://github.com/kniajevich/vexon/releases/download/latest/SHA256SUMS`  
-`chmod +x vexond`
-
-**2. Configure Service & Start:**  
-`nft -f /opt/vexon/mlqos.nft && /opt/vexon/vexond &`
-
-**3. Verify Operational Status:**  
-`tc -s filter show dev br-lan ingress`  
-`logread -e vexond`
 
 ---
 
