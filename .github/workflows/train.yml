@@ -19,12 +19,12 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install ML Dependencies
+      - name: Install PyTorch CPU & NumPy
         run: |
           pip install --upgrade pip
-          pip install torch numpy --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy torch --index-url https://download.pytorch.org/whl/cpu
 
-      - name: Train and Export INT8 Model
+      - name: Execute Autonomous MLOps Pipeline
         run: python train/train.py
 
       - name: Publish Trained Model to Latest Release
@@ -32,7 +32,7 @@ jobs:
         with:
           tag_name: latest
           name: "Latest Autonomous INT8 Model Weights"
-          body: "Daily retrained INT8 weights optimized for gaming, voice and low-latency QoS."
+          body: "Daily retrained INT8 weights dynamically tuned via Cloudflare Radar telemetry."
           files: |
             model.bin
             model.sha256
