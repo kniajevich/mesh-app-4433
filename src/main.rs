@@ -17,7 +17,6 @@ pub fn fibonacci_flow_hash(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u1
     h = (h ^ dst_ip).wrapping_mul(PHI_32);
     h = (h ^ ports).wrapping_mul(PHI_32);
     h = (h ^ (proto as u32)).wrapping_mul(PHI_32);
-    // Старшие 10 бит (размер таблицы 1024 бакета)
     (h >> 22) as usize
 }
 
@@ -145,7 +144,7 @@ impl Int8Mlp {
             l2_out[i] = (val / 128).clamp(0, 127) as i8;
         }
 
-        // Слой 3: 16 -> 4 (Линейные выходные логиты)
+        // Слой 3: 16 -> 4 (Линейные логиты)
         let mut l3_out = [0i32; 4];
         for i in 0..4 {
             let mut acc = self.b3[i];
@@ -177,7 +176,7 @@ impl Int8Mlp {
 async fn spawn_model_updater(active_model: Arc<ArcSwap<Int8Mlp>>, repo: String) {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
-        .user_agent("smart-qosd-updater")
+        .user_agent("vexond-updater")
         .build()
         .unwrap_or_default();
 
@@ -189,7 +188,6 @@ async fn spawn_model_updater(active_model: Arc<ArcSwap<Int8Mlp>>, repo: String) 
             interval.tick().await;
 
             let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-            // Cache-busting: исключаем отдачу устаревшего файла из CDN GitHub
             let sha_url = format!("https://github.com/{}/releases/download/latest/model.sha256?t={}", repo, ts);
             let bin_url = format!("https://github.com/{}/releases/download/latest/model.bin?t={}", repo, ts);
 
@@ -236,12 +234,12 @@ async fn spawn_model_updater(active_model: Arc<ArcSwap<Int8Mlp>>, repo: String) 
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Starting smart-qosd with INT8 MLP classification engine...");
+    println!("Starting vexond with INT8 MLP classification engine...");
 
     let initial_model = Arc::new(ArcSwap::from_pointee(Int8Mlp::fallback()));
-    spawn_model_updater(initial_model.clone(), "kniajevich/mesh-app-4433".to_string()).await;
+    // Привязка к переименованному репозиторию kniajevich/vexon
+    spawn_model_updater(initial_model.clone(), "kniajevich/vexon".to_string()).await;
 
-    // Проверка хэширования потока через константу Золотого Сечения
     let sample_bucket = fibonacci_flow_hash(0xC0A80101, 0x08080808, 4433, 443, 6);
     println!("Fibonacci Hash Engine initialized. Sample bucket: {}", sample_bucket);
 
@@ -250,6 +248,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Engine booted. Self-test prediction: Class {}", class_id);
 
     tokio::signal::ctrl_c().await?;
-    println!("Shutting down smart-qosd...");
+    println!("Shutting down vexond...");
     Ok(())
 }
