@@ -40,12 +40,12 @@ jobs:
         with:
           targets: aarch64-unknown-linux-musl
 
-      - name: Build smart-qosd binary (musl static)
+      - name: Build vexond binary (musl static)
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
         run: |
           cargo build --release --target aarch64-unknown-linux-musl
-          cp target/aarch64-unknown-linux-musl/release/smart-qosd ./smart-qosd
+          cp target/aarch64-unknown-linux-musl/release/vexond ./vexond
 
       - name: Attach binaries to latest release
         uses: softprops/action-gh-release@v2
@@ -53,7 +53,7 @@ jobs:
         with:
           tag_name: latest
           files: |
-            smart-qosd
+            vexond
             ebpf/filter.bpf.o
             rules/mlqos.nft
         env:
