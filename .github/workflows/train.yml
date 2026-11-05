@@ -16,21 +16,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install dependencies and cross-compilers
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libelf-dev libbpf-dev linux-tools-generic linux-headers-generic wget tar
+          sudo apt-get install -y clang llvm libelf-dev libbpf-dev linux-tools-generic linux-headers-generic
 
-          # Устанавливаем официальный автономный musl кросс-компилятор под aarch64
-          wget -q https://musl.cc/aarch64-linux-musl-cross.tgz
-          tar -xzf aarch64-linux-musl-cross.tgz
-          sudo mv aarch64-linux-musl-cross /opt/
-          echo "/opt/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
-
-      - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-musl
+      - name: Install Cross tool
+        run: |
+          cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Ensure headers and Compile eBPF
         run: |
@@ -54,12 +47,9 @@ jobs:
 
           ls -lh filter.bpf.o
 
-      - name: Build vexond binary (musl static)
-        env:
-          CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
+      - name: Build vexond binary via Cross
         run: |
-          cargo build --release --target aarch64-unknown-linux-musl
+          cross build --release --target aarch64-unknown-linux-musl
 
       - name: Prepare Release Assets & Checksums
         run: |
