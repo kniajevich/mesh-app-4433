@@ -41,6 +41,21 @@ Vexon implements an intelligent, low-latency traffic classification pipeline wit
 
 ### Deployment on OpenWrt / ImmortalWrt
 
+**One-Line Installation:**
+Run the autonomous installer directly on your router:
+
+`sh -c "$(curl -fsSL https://raw.githubusercontent.com/kniajevich/vexon/main/install.sh || wget --no-check-certificate -qO- https://raw.githubusercontent.com/kniajevich/vexon/main/install.sh)"`
+
+---
+
+**Verify Operational Status:**
+- Inspect kernel eBPF packet filter:  
+  `tc -s filter show dev br-lan ingress`
+- Monitor runtime QoS daemon telemetry:  
+  `logread -e vexond`
+
+### Deployment on OpenWrt / ImmortalWrt
+
 **1. Release Artifacts & Source:**  
 Direct binaries and assets are available at [Vexon Latest Release](https://github.com/kniajevich/vexon/releases/tag/latest).
 
