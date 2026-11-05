@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
@@ -5,19 +7,89 @@ use sha2::{Digest, Sha256};
 use tokio::time;
 
 pub const MODEL_BIN_SIZE: usize = 1308;
-
-// Константа Золотого Сечения (Golden Ratio) ядра Linux для 32-битного Фибоначчиева хэширования
 pub const PHI_32: u32 = 0x9E3779B9;
 
-/// Фибоначчиево хэширование 5-tuple сетевого соединения в 1 такт CPU
-#[inline(always)]
-pub fn fibonacci_flow_hash(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, proto: u8) -> usize {
-    let ports = ((src_port as u32) << 16) | (dst_port as u32);
-    let mut h = src_ip.wrapping_mul(PHI_32);
-    h = (h ^ dst_ip).wrapping_mul(PHI_32);
-    h = (h ^ ports).wrapping_mul(PHI_32);
-    h = (h ^ (proto as u32)).wrapping_mul(PHI_32);
-    (h >> 22) as usize
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct FlowKey {
+    pub src_ip: u32,
+    pub dst_ip: u32,
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub protocol: u8,
+    pub _pad: [u8; 3],
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct FlowMetrics {
+    pub class_id: u8,
+    pub classified: u8,
+    pub pkt_count: u16,
+    pub last_len: u32,
+    pub last_time: u64,
+}
+
+// Прямой системный вызов BPF ядра Linux (совместим с musl libc)
+unsafe fn bpf_map_update(fd: i32, key: *const FlowKey, val: *const FlowMetrics) -> i32 {
+    #[repr(C)]
+    struct BpfAttrUpdate {
+        map_fd: u32,
+        pad0: u32,
+        key: u64,
+        value: u64,
+        flags: u64,
+    }
+
+    let attr = BpfAttrUpdate {
+        map_fd: fd as u32,
+        pad0: 0,
+        key: key as u64,
+        value: val as u64,
+        flags: 0,
+    };
+
+    libc::syscall(libc::SYS_bpf, 2, &attr, std::mem::size_of::<BpfAttrUpdate>()) as i32
+}
+
+unsafe fn bpf_map_get_next_key(fd: i32, key: *const FlowKey, next_key: *mut FlowKey) -> i32 {
+    #[repr(C)]
+    struct BpfAttrNext {
+        map_fd: u32,
+        pad0: u32,
+        key: u64,
+        next_key: u64,
+    }
+
+    let attr = BpfAttrNext {
+        map_fd: fd as u32,
+        pad0: 0,
+        key: key as u64,
+        next_key: next_key as u64,
+    };
+
+    libc::syscall(libc::SYS_bpf, 4, &attr, std::mem::size_of::<BpfAttrNext>()) as i32
+}
+
+unsafe fn bpf_map_lookup(fd: i32, key: *const FlowKey, val: *mut FlowMetrics) -> i32 {
+    #[repr(C)]
+    struct BpfAttrLookup {
+        map_fd: u32,
+        pad0: u32,
+        key: u64,
+        value: u64,
+        flags: u64,
+    }
+
+    let attr = BpfAttrLookup {
+        map_fd: fd as u32,
+        pad0: 0,
+        key: key as u64,
+        value: val as u64,
+        flags: 0,
+    };
+
+    libc::syscall(libc::SYS_bpf, 1, &attr, std::mem::size_of::<BpfAttrLookup>()) as i32
 }
 
 #[derive(Clone, Debug)]
@@ -42,7 +114,6 @@ impl Int8Mlp {
         }
 
         let mut offset = 0;
-
         let mut read_w1 = [[0i8; 16]; 32];
         for row in &mut read_w1 {
             for val in row {
@@ -117,10 +188,8 @@ impl Int8Mlp {
         }
     }
 
-    /// Инференс с защитой от переполнения через насыщающую арифметику (saturating)
     #[inline(always)]
     pub fn forward(&self, input: &[i8; 16]) -> [i32; 4] {
-        // Слой 1: 16 -> 32 (ReLU)
         let mut l1_out = [0i8; 32];
         for i in 0..32 {
             let mut acc = self.b1[i];
@@ -132,7 +201,6 @@ impl Int8Mlp {
             l1_out[i] = (val / 128).clamp(0, 127) as i8;
         }
 
-        // Слой 2: 32 -> 16 (ReLU)
         let mut l2_out = [0i8; 16];
         for i in 0..16 {
             let mut acc = self.b2[i];
@@ -144,7 +212,6 @@ impl Int8Mlp {
             l2_out[i] = (val / 128).clamp(0, 127) as i8;
         }
 
-        // Слой 3: 16 -> 4 (Линейные логиты)
         let mut l3_out = [0i32; 4];
         for i in 0..4 {
             let mut acc = self.b3[i];
@@ -171,6 +238,51 @@ impl Int8Mlp {
         }
         max_idx as u8
     }
+}
+
+// Запуск цикла инференса по BPF карте
+fn start_kernel_classifier(model: Arc<ArcSwap<Int8Mlp>>) {
+    tokio::spawn(async move {
+        let map_path = "/sys/fs/bpf/tc/globals/flow_table";
+        let mut interval = time::interval(Duration::from_millis(100));
+
+        loop {
+            interval.tick().await;
+
+            let file = match File::open(map_path) {
+                Ok(f) => f,
+                Err(_) => continue, // Ожидание загрузки eBPF карты ядром
+            };
+            let map_fd = file.as_raw_fd();
+
+            let mut prev_key = FlowKey::default();
+            let mut next_key = FlowKey::default();
+
+            // Проход по потокам через syscall BPF_MAP_GET_NEXT_KEY
+            while unsafe { bpf_map_get_next_key(map_fd, &prev_key, &mut next_key) } == 0 {
+                let mut metric = FlowMetrics::default();
+                if unsafe { bpf_map_lookup(map_fd, &next_key, &mut metric) } == 0 {
+                    if metric.classified == 0 && metric.pkt_count >= 3 {
+                        // Формирование 16 характеристик потока для модели
+                        let mut features = [0i8; 16];
+                        features[0] = ((metric.last_len as i32 * 127) / 1500).clamp(-128, 127) as i8;
+                        features[3] = next_key.protocol as i8;
+                        features[11] = (next_key.dst_port % 127) as i8;
+                        features[12] = (next_key.src_port % 127) as i8;
+
+                        let class = model.load().classify(&features);
+                        metric.class_id = class;
+                        metric.classified = 1;
+
+                        unsafe {
+                            bpf_map_update(map_fd, &next_key, &metric);
+                        }
+                    }
+                }
+                prev_key = next_key;
+            }
+        }
+    });
 }
 
 async fn spawn_model_updater(active_model: Arc<ArcSwap<Int8Mlp>>, repo: String) {
@@ -210,7 +322,6 @@ async fn spawn_model_updater(active_model: Arc<ArcSwap<Int8Mlp>>, repo: String) 
             };
 
             if bin_resp.len() != MODEL_BIN_SIZE {
-                eprintln!("[Model Update] Size mismatch: got {}, expected {}", bin_resp.len(), MODEL_BIN_SIZE);
                 continue;
             }
 
@@ -219,7 +330,6 @@ async fn spawn_model_updater(active_model: Arc<ArcSwap<Int8Mlp>>, repo: String) 
             let calculated_sha = format!("{:x}", hasher.finalize());
 
             if calculated_sha != remote_sha {
-                eprintln!("[Model Update] SHA256 mismatch: calculated {}, expected {}", calculated_sha, remote_sha);
                 continue;
             }
 
@@ -234,18 +344,15 @@ async fn spawn_model_updater(active_model: Arc<ArcSwap<Int8Mlp>>, repo: String) 
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Starting vexond with INT8 MLP classification engine...");
+    println!("Starting vexond autonomous QoS daemon...");
 
     let initial_model = Arc::new(ArcSwap::from_pointee(Int8Mlp::fallback()));
-    // Привязка к переименованному репозиторию kniajevich/vexon
+    
+    // Запуск классификатора ядра и фонового апдейтера
+    start_kernel_classifier(initial_model.clone());
     spawn_model_updater(initial_model.clone(), "kniajevich/vexon".to_string()).await;
 
-    let sample_bucket = fibonacci_flow_hash(0xC0A80101, 0x08080808, 4433, 443, 6);
-    println!("Fibonacci Hash Engine initialized. Sample bucket: {}", sample_bucket);
-
-    let sample_features: [i8; 16] = [40, 6, 2, 0, 15, 3, 12, 8, 0, 1, 4, 10, 0, 0, 5, 2];
-    let class_id = initial_model.load().classify(&sample_features);
-    println!("Engine booted. Self-test prediction: Class {}", class_id);
+    println!("vexond engine running. Listening to kernel eBPF map /sys/fs/bpf/tc/globals/flow_table");
 
     tokio::signal::ctrl_c().await?;
     println!("Shutting down vexond...");
