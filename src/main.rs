@@ -1,5 +1,4 @@
-use std::fs::File;
-use std::os::unix::io::AsRawFd;
+use std::ffi::CString;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
@@ -9,7 +8,8 @@ use tokio::time;
 pub const MODEL_BIN_SIZE: usize = 1308;
 pub const PHI_32: u32 = 0x9E3779B9;
 
-#[repr(C, packed)]
+// Заменено с packed на безопасный C-ABI с сохранением точного выравнивания
+#[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct FlowKey {
     pub src_ip: u32,
@@ -20,7 +20,7 @@ pub struct FlowKey {
     pub _pad: [u8; 3],
 }
 
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct FlowMetrics {
     pub class_id: u8,
@@ -30,7 +30,30 @@ pub struct FlowMetrics {
     pub last_time: u64,
 }
 
-// Прямой системный вызов BPF ядра Linux (совместим с musl libc)
+// BPF_OBJ_GET (7): получение валидного файлового дескриптора карты eBPF ядра Linux
+unsafe fn bpf_obj_get(path: &str) -> i32 {
+    #[repr(C)]
+    struct BpfAttrObjGet {
+        pathname: u64,
+        bpf_fd: u32,
+        file_flags: u32,
+    }
+
+    let c_path = match CString::new(path) {
+        Ok(p) => p,
+        Err(_) => return -1,
+    };
+
+    let attr = BpfAttrObjGet {
+        pathname: c_path.as_ptr() as u64,
+        bpf_fd: 0,
+        file_flags: 0, // 0 = O_RDWR (чтение и запись)
+    };
+
+    libc::syscall(libc::SYS_bpf, 7, &attr, std::mem::size_of::<BpfAttrObjGet>()) as i32
+}
+
+// BPF_MAP_UPDATE_ELEM (2)
 unsafe fn bpf_map_update(fd: i32, key: *const FlowKey, val: *const FlowMetrics) -> i32 {
     #[repr(C)]
     struct BpfAttrUpdate {
@@ -52,6 +75,7 @@ unsafe fn bpf_map_update(fd: i32, key: *const FlowKey, val: *const FlowMetrics) 
     libc::syscall(libc::SYS_bpf, 2, &attr, std::mem::size_of::<BpfAttrUpdate>()) as i32
 }
 
+// BPF_MAP_GET_NEXT_KEY (4)
 unsafe fn bpf_map_get_next_key(fd: i32, key: *const FlowKey, next_key: *mut FlowKey) -> i32 {
     #[repr(C)]
     struct BpfAttrNext {
@@ -71,6 +95,7 @@ unsafe fn bpf_map_get_next_key(fd: i32, key: *const FlowKey, next_key: *mut Flow
     libc::syscall(libc::SYS_bpf, 4, &attr, std::mem::size_of::<BpfAttrNext>()) as i32
 }
 
+// BPF_MAP_LOOKUP_ELEM (1)
 unsafe fn bpf_map_lookup(fd: i32, key: *const FlowKey, val: *mut FlowMetrics) -> i32 {
     #[repr(C)]
     struct BpfAttrLookup {
@@ -240,121 +265,35 @@ impl Int8Mlp {
     }
 }
 
-// Запуск цикла инференса по BPF карте
+// Фоновый сканер карты eBPF ядра Linux с прямым получением BPF FD через BPF_OBJ_GET
 fn start_kernel_classifier(model: Arc<ArcSwap<Int8Mlp>>) {
     tokio::spawn(async move {
         let map_path = "/sys/fs/bpf/tc/globals/flow_table";
         let mut interval = time::interval(Duration::from_millis(100));
+        let mut map_fd = -1;
 
         loop {
             interval.tick().await;
 
-            let file = match File::open(map_path) {
-                Ok(f) => f,
-                Err(_) => continue, // Ожидание загрузки eBPF карты ядром
-            };
-            let map_fd = file.as_raw_fd();
+            // Запрашиваем настоящий BPF FD, если карта еще не была подключена
+            if map_fd < 0 {
+                map_fd = unsafe { bpf_obj_get(map_path) };
+                if map_fd < 0 {
+                    continue; // Ожидаем, пока init-скрипт tc загрузит eBPF и создаст карту
+                }
+                println!("[Data-Plane] eBPF map connected successfully! FD: {}", map_fd);
+            }
 
             let mut prev_key = FlowKey::default();
             let mut next_key = FlowKey::default();
 
-            // Проход по потокам через syscall BPF_MAP_GET_NEXT_KEY
+            // Обход всех потоков через системный вызов BPF_MAP_GET_NEXT_KEY
             while unsafe { bpf_map_get_next_key(map_fd, &prev_key, &mut next_key) } == 0 {
                 let mut metric = FlowMetrics::default();
                 if unsafe { bpf_map_lookup(map_fd, &next_key, &mut metric) } == 0 {
                     if metric.classified == 0 && metric.pkt_count >= 3 {
-                        // Формирование 16 характеристик потока для модели
                         let mut features = [0i8; 16];
                         features[0] = ((metric.last_len as i32 * 127) / 1500).clamp(-128, 127) as i8;
                         features[3] = next_key.protocol as i8;
                         features[11] = (next_key.dst_port % 127) as i8;
-                        features[12] = (next_key.src_port % 127) as i8;
-
-                        let class = model.load().classify(&features);
-                        metric.class_id = class;
-                        metric.classified = 1;
-
-                        unsafe {
-                            bpf_map_update(map_fd, &next_key, &metric);
-                        }
-                    }
-                }
-                prev_key = next_key;
-            }
-        }
-    });
-}
-
-async fn spawn_model_updater(active_model: Arc<ArcSwap<Int8Mlp>>, repo: String) {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .user_agent("vexond-updater")
-        .build()
-        .unwrap_or_default();
-
-    let mut current_sha = String::new();
-    let mut interval = time::interval(Duration::from_secs(12 * 3600));
-
-    tokio::spawn(async move {
-        loop {
-            interval.tick().await;
-
-            let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-            let sha_url = format!("https://github.com/{}/releases/download/latest/model.sha256?t={}", repo, ts);
-            let bin_url = format!("https://github.com/{}/releases/download/latest/model.bin?t={}", repo, ts);
-
-            let sha_resp = match client.get(&sha_url).send().await {
-                Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
-                _ => continue,
-            };
-
-            let remote_sha = sha_resp.split_whitespace().next().unwrap_or("").to_lowercase();
-            if remote_sha.is_empty() || remote_sha == current_sha {
-                continue;
-            }
-
-            let bin_resp = match client.get(&bin_url).send().await {
-                Ok(r) if r.status().is_success() => match r.bytes().await {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                },
-                _ => continue,
-            };
-
-            if bin_resp.len() != MODEL_BIN_SIZE {
-                continue;
-            }
-
-            let mut hasher = Sha256::new();
-            hasher.update(&bin_resp);
-            let calculated_sha = format!("{:x}", hasher.finalize());
-
-            if calculated_sha != remote_sha {
-                continue;
-            }
-
-            if let Ok(new_mlp) = Int8Mlp::from_bytes(&bin_resp) {
-                active_model.store(Arc::new(new_mlp));
-                current_sha = remote_sha;
-                println!("[Model Update] Successfully applied new INT8 weights. SHA: {}", current_sha);
-            }
-        }
-    });
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Starting vexond autonomous QoS daemon...");
-
-    let initial_model = Arc::new(ArcSwap::from_pointee(Int8Mlp::fallback()));
-    
-    // Запуск классификатора ядра и фонового апдейтера
-    start_kernel_classifier(initial_model.clone());
-    spawn_model_updater(initial_model.clone(), "kniajevich/vexon".to_string()).await;
-
-    println!("vexond engine running. Listening to kernel eBPF map /sys/fs/bpf/tc/globals/flow_table");
-
-    tokio::signal::ctrl_c().await?;
-    println!("Shutting down vexond...");
-    Ok(())
-}
+                        features
