@@ -25,7 +25,6 @@ struct flow_metrics {
     __u64 last_time;
 };
 
-// Фиксированная привязанная (pinned) карта в памяти ядра
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 65536);
@@ -82,8 +81,13 @@ int tc_classify(struct __sk_buff *skb) {
     struct flow_metrics *metric = bpf_map_lookup_elem(&flow_table, &key);
     if (metric) {
         if (metric->classified) {
-            __u32 current_mark = skb->mark & ~QOS_MARK_MASK;
-            skb->mark = current_mark | ((__u32)metric->class_id << QOS_MARK_SHIFT);
+            __u32 mark = skb->mark;
+            mark &= ~QOS_MARK_MASK;
+            mark |= ((__u32)metric->class_id << QOS_MARK_SHIFT);
+
+            /* Принудительная 32-битная атомарная запись без разбивки на байты */
+            asm volatile("" : "+r"(mark));
+            skb->mark = mark;
         } else {
             metric->pkt_count++;
             metric->last_len = pkt_len;
@@ -91,7 +95,7 @@ int tc_classify(struct __sk_buff *skb) {
         }
     } else {
         struct flow_metrics init_m = {
-            .class_id = 2, // Best Effort по умолчанию
+            .class_id = 2,
             .classified = 0,
             .pkt_count = 1,
             .last_len = pkt_len,
