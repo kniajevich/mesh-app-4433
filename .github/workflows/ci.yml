@@ -19,19 +19,36 @@ jobs:
       - name: Install dependencies and cross-compilers
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libelf-dev gcc-aarch64-linux-gnu musl-tools
+          sudo apt-get install -y clang llvm libelf-dev libbpf-dev linux-tools-generic linux-headers-generic gcc-aarch64-linux-gnu musl-tools
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-musl
 
-      - name: Compile eBPF kernel program (Clang)
+      - name: Ensure headers and Compile eBPF
         run: |
+          # 1. Генерируем vmlinux.h, если его нет в репозитории
+          if [ ! -f "vmlinux.h" ] && [ ! -f "bpf/vmlinux.h" ]; then
+            echo "[*] Generating vmlinux.h via bpftool..."
+            sudo bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h 2>/dev/null || true
+          fi
+
+          # 2. Находим filter.bpf.c
           BPF_SRC=$(find . -name "filter.bpf.c" | head -n 1)
           BPF_DIR=$(dirname "$BPF_SRC")
-          echo "Compiling $BPF_SRC with include dir $BPF_DIR..."
-          clang -O2 -target bpf -I "$BPF_DIR" -I . -c "$BPF_SRC" -o filter.bpf.o
+          echo "Found BPF source at: $BPF_SRC"
+
+          # 3. Компилируем со всеми путями заголовков (включая libbpf)
+          clang -O2 -target bpf \
+            -D__TARGET_ARCH_arm64 \
+            -I . \
+            -I "$BPF_DIR" \
+            -I /usr/include \
+            -I /usr/include/bpf \
+            -I /usr/include/aarch64-linux-gnu \
+            -c "$BPF_SRC" -o filter.bpf.o
+
           ls -lh filter.bpf.o
 
       - name: Build vexond binary (musl static)
@@ -44,7 +61,6 @@ jobs:
           cp target/aarch64-unknown-linux-musl/release/vexond release_dist/vexond
           cp filter.bpf.o release_dist/filter.bpf.o
           
-          # Копируем model.bin и mlqos.nft, если есть, иначе создаем валидные заглушки
           if [ -f "model.bin" ]; then 
             cp model.bin release_dist/
           else 
