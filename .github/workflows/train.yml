@@ -19,38 +19,45 @@ jobs:
       - name: Install dependencies and cross-compilers
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libelf-dev linux-tools-generic linux-headers-generic gcc-aarch64-linux-gnu musl-tools
+          sudo apt-get install -y clang llvm libelf-dev libbpf-dev linux-tools-generic linux-headers-generic wget tar
+
+          # Устанавливаем официальный автономный musl кросс-компилятор под aarch64
+          wget -q https://musl.cc/aarch64-linux-musl-cross.tgz
+          tar -xzf aarch64-linux-musl-cross.tgz
+          sudo mv aarch64-linux-musl-cross /opt/
+          echo "/opt/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-musl
 
-      - name: Ensure vmlinux.h and Compile eBPF
+      - name: Ensure headers and Compile eBPF
         run: |
-          # 1. Ищем существующий vmlinux.h или генерируем из BTF ядра
           if [ ! -f "vmlinux.h" ] && [ ! -f "bpf/vmlinux.h" ]; then
             echo "[*] Generating vmlinux.h via bpftool..."
             sudo bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h 2>/dev/null || true
           fi
 
-          # 2. Находим путь к filter.bpf.c
           BPF_SRC=$(find . -name "filter.bpf.c" | head -n 1)
           BPF_DIR=$(dirname "$BPF_SRC")
           echo "Found BPF source at: $BPF_SRC"
 
-          # 3. Собираем все возможные директории инклудов
-          INCLUDE_DIRS="-I . -I $BPF_DIR"
-          VMLINUX_LOC=$(find . -name "vmlinux.h" | head -n 1)
-          if [ -n "$VMLINUX_LOC" ]; then
-            INCLUDE_DIRS="$INCLUDE_DIRS -I $(dirname "$VMLINUX_LOC")"
-          fi
+          clang -O2 -target bpf \
+            -D__TARGET_ARCH_arm64 \
+            -I . \
+            -I "$BPF_DIR" \
+            -I /usr/include \
+            -I /usr/include/bpf \
+            -I /usr/include/aarch64-linux-gnu \
+            -c "$BPF_SRC" -o filter.bpf.o
 
-          echo "Compiling with flags: $INCLUDE_DIRS"
-          clang -O2 -target bpf $INCLUDE_DIRS -c "$BPF_SRC" -o filter.bpf.o
           ls -lh filter.bpf.o
 
       - name: Build vexond binary (musl static)
+        env:
+          CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
         run: |
           cargo build --release --target aarch64-unknown-linux-musl
 
