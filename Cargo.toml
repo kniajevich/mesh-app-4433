@@ -8,6 +8,7 @@ tokio = { version = "1.38", features = ["full", "signal"] }
 arc-swap = "1.7"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 sha2 = "0.10"
+libc = "0.2"
 
 [profile.release]
 opt-level = 3
