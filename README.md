@@ -9,13 +9,9 @@ Vexon implements an intelligent, low-latency traffic classification pipeline wit
 ### Key Highlights
 
 - **Zero-Dependency Inference:** No ONNX Runtime or TensorFlow-Lite. Model weights (model.bin) occupy exactly 1308 bytes, eliminating overhead and preserving CPU cycles.
-
 - **LRU Session Tracking:** Kernel data-plane uses BPF_MAP_TYPE_LRU_HASH (65k entries) to automatically evict stale flows during heavy P2P/torrent traffic, preventing table overflow.
-
 - **Kernel & Fwd Friendly:** Packets are tagged strictly in the high-byte of skb->mark (0xFF000000), ensuring zero conflicts with OpenWrt forward rules, NAT, or Multi-WAN routing tables.
-
 - **Deterministic & Memory Safe:** Saturation arithmetic prevents integer overflow crashes. Memory layout is fully aligned and eBPF verifier compliant.
-
 - **Autonomous Self-Updater:** The daemon periodically pulls release metadata, validates payload integrity via SHA256SUMS, and performs atomic in-memory (ArcSwap), kernel (tc filter replace), and binary updates without manual intervention.
 
 ---
@@ -45,8 +41,17 @@ Vexon implements an intelligent, low-latency traffic classification pipeline wit
 
 ### Deployment on OpenWrt / ImmortalWrt
 
-**1. Download Release Artifacts:**  
-`mkdir -p /opt/vexon && cd /opt/vexon && for f in vexond filter.bpf.o model.bin mlqos.nft SHA256SUMS; do wget -qO "$f" "https://github.com/kniajevich/vexon/releases/download/latest/$f"; done && chmod +x vexond`
+**1. Release Artifacts & Source:**  
+Direct binaries and assets are available at [Vexon Latest Release](https://github.com/kniajevich/vexon/releases/tag/latest).
+
+To fetch directly on the router:  
+`mkdir -p /opt/vexon && cd /opt/vexon`  
+`wget -qO vexond https://github.com/kniajevich/vexon/releases/download/latest/vexond`  
+`wget -qO filter.bpf.o https://github.com/kniajevich/vexon/releases/download/latest/filter.bpf.o`  
+`wget -qO model.bin https://github.com/kniajevich/vexon/releases/download/latest/model.bin`  
+`wget -qO mlqos.nft https://github.com/kniajevich/vexon/releases/download/latest/mlqos.nft`  
+`wget -qO SHA256SUMS https://github.com/kniajevich/vexon/releases/download/latest/SHA256SUMS`  
+`chmod +x vexond`
 
 **2. Configure Service & Start:**  
 `nft -f /opt/vexon/mlqos.nft && /opt/vexon/vexond &`
