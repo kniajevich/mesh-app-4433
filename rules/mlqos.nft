@@ -1,14 +1,11 @@
 table inet mlqos {
     chain prerouting {
         type filter hook prerouting priority mangle; policy accept;
-
-        # Читаем только старший байт skb->mark (сдвиг 24 бита), не трогая системные метки OpenWrt fw4
         meta mark & 0xff000000 == 0x00000000 ip dscp set cs0
         meta mark & 0xff000000 == 0x01000000 ip dscp set af41
         meta mark & 0xff000000 == 0x02000000 ip dscp set cs1
         meta mark & 0xff000000 == 0x03000000 ip dscp set ef
     }
-
     chain postrouting {
         type filter hook postrouting priority mangle; policy accept;
     }
