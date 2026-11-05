@@ -1,4 +1,8 @@
+use std::collections::HashMap;
 use std::ffi::CString;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::process::{Command, exit};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
@@ -6,7 +10,8 @@ use sha2::{Digest, Sha256};
 use tokio::time;
 
 pub const MODEL_BIN_SIZE: usize = 1308;
-pub const PHI_32: u32 = 0x9E3779B9;
+const REPO: &str = "kniajevich/vexon";
+const INSTALL_DIR: &str = "/opt/vexon";
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
@@ -29,7 +34,6 @@ pub struct FlowMetrics {
     pub last_time: u64,
 }
 
-// BPF_OBJ_GET (7): получение валидного BPF FD из виртуальной FS ядра
 unsafe fn bpf_obj_get(path: &str) -> i32 {
     #[repr(C)]
     struct BpfAttrObjGet {
@@ -52,7 +56,6 @@ unsafe fn bpf_obj_get(path: &str) -> i32 {
     libc::syscall(libc::SYS_bpf, 7, &attr, std::mem::size_of::<BpfAttrObjGet>()) as i32
 }
 
-// BPF_MAP_UPDATE_ELEM (2)
 unsafe fn bpf_map_update(fd: i32, key: *const FlowKey, val: *const FlowMetrics) -> i32 {
     #[repr(C)]
     struct BpfAttrUpdate {
@@ -74,7 +77,6 @@ unsafe fn bpf_map_update(fd: i32, key: *const FlowKey, val: *const FlowMetrics) 
     libc::syscall(libc::SYS_bpf, 2, &attr, std::mem::size_of::<BpfAttrUpdate>()) as i32
 }
 
-// BPF_MAP_GET_NEXT_KEY (4)
 unsafe fn bpf_map_get_next_key(fd: i32, key: *const FlowKey, next_key: *mut FlowKey) -> i32 {
     #[repr(C)]
     struct BpfAttrNext {
@@ -94,7 +96,6 @@ unsafe fn bpf_map_get_next_key(fd: i32, key: *const FlowKey, next_key: *mut Flow
     libc::syscall(libc::SYS_bpf, 4, &attr, std::mem::size_of::<BpfAttrNext>()) as i32
 }
 
-// BPF_MAP_LOOKUP_ELEM (1)
 unsafe fn bpf_map_lookup(fd: i32, key: *const FlowKey, val: *mut FlowMetrics) -> i32 {
     #[repr(C)]
     struct BpfAttrLookup {
@@ -121,11 +122,9 @@ pub struct Int8Mlp {
     pub w1: [[i8; 16]; 32],
     pub b1: [i32; 32],
     pub scale1: f32,
-
     pub w2: [[i8; 32]; 16],
     pub b2: [i32; 16],
     pub scale2: f32,
-
     pub w3: [[i8; 16]; 4],
     pub b3: [i32; 4],
     pub scale3: f32,
@@ -134,7 +133,7 @@ pub struct Int8Mlp {
 impl Int8Mlp {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
         if bytes.len() != MODEL_BIN_SIZE {
-            return Err("Invalid model.bin size: byte count mismatch");
+            return Err("Invalid model.bin size");
         }
 
         let mut offset = 0;
@@ -264,6 +263,13 @@ impl Int8Mlp {
     }
 }
 
+fn calculate_file_sha256(path: &str) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Some(format!("{:x}", hasher.finalize()))
+}
+
 fn start_kernel_classifier(model: Arc<ArcSwap<Int8Mlp>>) {
     tokio::spawn(async move {
         let map_path = "/sys/fs/bpf/tc/globals/flow_table";
@@ -309,58 +315,100 @@ fn start_kernel_classifier(model: Arc<ArcSwap<Int8Mlp>>) {
     });
 }
 
-async fn spawn_model_updater(active_model: Arc<ArcSwap<Int8Mlp>>, repo: String) {
+async fn run_autonomous_updater(active_model: Arc<ArcSwap<Int8Mlp>>) {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .user_agent("vexond-updater")
+        .timeout(Duration::from_secs(30))
+        .user_agent("vexond-agent")
         .build()
         .unwrap_or_default();
 
-    let mut current_sha = String::new();
-    let mut interval = time::interval(Duration::from_secs(12 * 3600));
+    // Проверяем обновления каждые 4 часа
+    let mut interval = time::interval(Duration::from_secs(4 * 3600));
 
     tokio::spawn(async move {
         loop {
             interval.tick().await;
 
             let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-            let sha_url = format!("https://github.com/{}/releases/download/latest/model.sha256?t={}", repo, ts);
-            let bin_url = format!("https://github.com/{}/releases/download/latest/model.bin?t={}", repo, ts);
+            let sums_url = format!("https://github.com/{}/releases/download/latest/SHA256SUMS?t={}", REPO, ts);
 
-            let sha_resp = match client.get(&sha_url).send().await {
+            let resp = match client.get(&sums_url).send().await {
                 Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
                 _ => continue,
             };
 
-            let remote_sha = sha_resp.split_whitespace().next().unwrap_or("").to_lowercase();
-            if remote_sha.is_empty() || remote_sha == current_sha {
-                continue;
+            let mut remote_hashes = HashMap::new();
+            for line in resp.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() == 2 {
+                    let filename = parts[1].trim_start_matches("./").trim_start_matches('*');
+                    remote_hashes.insert(filename.to_string(), parts[0].to_lowercase());
+                }
             }
 
-            let bin_resp = match client.get(&bin_url).send().await {
-                Ok(r) if r.status().is_success() => match r.bytes().await {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                },
-                _ => continue,
-            };
-
-            if bin_resp.len() != MODEL_BIN_SIZE {
-                continue;
+            // 1. Проверяем обновление модели
+            if let Some(remote_sha) = remote_hashes.get("model.bin") {
+                let local_sha = calculate_file_sha256(&format!("{}/model.bin", INSTALL_DIR)).unwrap_or_default();
+                if local_sha != *remote_sha {
+                    let bin_url = format!("https://github.com/{}/releases/download/latest/model.bin?t={}", REPO, ts);
+                    if let Ok(b_res) = client.get(&bin_url).send().await {
+                        if let Ok(bytes) = b_res.bytes().await {
+                            if bytes.len() == MODEL_BIN_SIZE {
+                                if let Ok(new_mlp) = Int8Mlp::from_bytes(&bytes) {
+                                    let _ = fs::write(format!("{}/model.bin", INSTALL_DIR), &bytes);
+                                    active_model.store(Arc::new(new_mlp));
+                                    println!("[AutoUpdater] Model weights updated to {}", remote_sha);
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
-            let mut hasher = Sha256::new();
-            hasher.update(&bin_resp);
-            let calculated_sha = format!("{:x}", hasher.finalize());
-
-            if calculated_sha != remote_sha {
-                continue;
+            // 2. Проверяем обновление eBPF-байткода (filter.bpf.o)
+            if let Some(remote_sha) = remote_hashes.get("filter.bpf.o") {
+                let local_sha = calculate_file_sha256(&format!("{}/filter.bpf.o", INSTALL_DIR)).unwrap_or_default();
+                if local_sha != *remote_sha {
+                    let bpf_url = format!("https://github.com/{}/releases/download/latest/filter.bpf.o?t={}", REPO, ts);
+                    if let Ok(b_res) = client.get(&bpf_url).send().await {
+                        if let Ok(bytes) = b_res.bytes().await {
+                            let target_path = format!("{}/filter.bpf.o", INSTALL_DIR);
+                            let tmp_path = format!("{}/filter.bpf.o.tmp", INSTALL_DIR);
+                            if fs::write(&tmp_path, &bytes).is_ok() && fs::rename(&tmp_path, &target_path).is_ok() {
+                                println!("[AutoUpdater] Hot-reloading eBPF filters on br-lan...");
+                                let _ = Command::new("tc")
+                                    .args(["filter", "replace", "dev", "br-lan", "ingress", "bpf", "da", "obj", &target_path, "sec", "classifier"])
+                                    .status();
+                                let _ = Command::new("tc")
+                                    .args(["filter", "replace", "dev", "br-lan", "egress", "bpf", "da", "obj", &target_path, "sec", "classifier"])
+                                    .status();
+                                println!("[AutoUpdater] eBPF bytecode updated successfully.");
+                            }
+                        }
+                    }
+                }
             }
 
-            if let Ok(new_mlp) = Int8Mlp::from_bytes(&bin_resp) {
-                active_model.store(Arc::new(new_mlp));
-                current_sha = remote_sha;
-                println!("[Model Update] Successfully applied new INT8 weights. SHA: {}", current_sha);
+            // 3. Проверяем обновление самого бинарника (vexond)
+            if let Some(remote_sha) = remote_hashes.get("vexond") {
+                let local_sha = calculate_file_sha256(&format!("{}/vexond", INSTALL_DIR)).unwrap_or_default();
+                if local_sha != *remote_sha {
+                    let bin_url = format!("https://github.com/{}/releases/download/latest/vexond?t={}", REPO, ts);
+                    if let Ok(b_res) = client.get(&bin_url).send().await {
+                        if let Ok(bytes) = b_res.bytes().await {
+                            let tmp_bin = format!("{}/vexond.tmp", INSTALL_DIR);
+                            let target_bin = format!("{}/vexond", INSTALL_DIR);
+                            if fs::write(&tmp_bin, &bytes).is_ok() {
+                                let _ = fs::set_permissions(&tmp_bin, fs::Permissions::from_mode(0o755));
+                                if fs::rename(&tmp_bin, &target_bin).is_ok() {
+                                    println!("[AutoUpdater] New vexond binary installed. Restarting via procd...");
+                                    // Выход из процесса: procd автоматически перезапустит обновленный бинарник
+                                    exit(0);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     });
@@ -368,16 +416,21 @@ async fn spawn_model_updater(active_model: Arc<ArcSwap<Int8Mlp>>, repo: String) 
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Starting vexond autonomous QoS daemon...");
+    println!("Starting autonomous Vexon QoS Engine...");
 
-    let initial_model = Arc::new(ArcSwap::from_pointee(Int8Mlp::fallback()));
-    
-    start_kernel_classifier(initial_model.clone());
-    spawn_model_updater(initial_model.clone(), "kniajevich/vexon".to_string()).await;
+    let model_path = format!("{}/model.bin", INSTALL_DIR);
+    let initial_mlp = match fs::read(&model_path) {
+        Ok(bytes) => Int8Mlp::from_bytes(&bytes).unwrap_or_else(|_| Int8Mlp::fallback()),
+        Err(_) => Int8Mlp::fallback(),
+    };
 
-    println!("vexond engine running. Listening to kernel eBPF map /sys/fs/bpf/tc/globals/flow_table");
+    let model = Arc::new(ArcSwap::from_pointee(initial_mlp));
 
+    start_kernel_classifier(model.clone());
+    run_autonomous_updater(model.clone()).await;
+
+    println!("Vexon engine running with zero-touch auto-updates enabled.");
     tokio::signal::ctrl_c().await?;
-    println!("Shutting down vexond...");
+    println!("Shutting down Vexon engine...");
     Ok(())
 }
