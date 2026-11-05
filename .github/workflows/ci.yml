@@ -1,4 +1,4 @@
-name: OpenWrt eBPF & Rust aarch64 musl CI
+name: OpenWrt eBPF & Rust aarch64-musl CI
 
 on:
   push:
@@ -11,50 +11,60 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Install Toolchain, bpftool and libbpf
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies and cross-compilers
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libelf-dev libbpf-dev bpftool gcc-aarch64-linux-gnu musl-tools
+          sudo apt-get install -y clang llvm libelf-dev gcc-aarch64-linux-gnu musl-tools
 
-      - name: Generate vmlinux.h from Host BTF
-        run: |
-          if [ -f /sys/kernel/btf/vmlinux ]; then
-            bpftool btf dump file /sys/kernel/btf/vmlinux format c > ebpf/vmlinux.h
-          else
-            echo -e "#ifndef __VMLINUX_H__\n#define __VMLINUX_H__\ntypedef unsigned char __u8;\ntypedef unsigned short __u16;\ntypedef unsigned int __u32;\ntypedef unsigned long long __u64;\n#endif" > ebpf/vmlinux.h
-          fi
-
-      - name: Compile eBPF Bytecode
-        run: |
-          clang -g -O2 -target bpf -D__TARGET_ARCH_arm64 \
-            -Iebpf \
-            -I/usr/include \
-            -I/usr/include/$(uname -m)-linux-gnu \
-            -c ebpf/filter.bpf.c -o ebpf/filter.bpf.o
-
-      - name: Setup Rust toolchain
+      - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-musl
 
+      - name: Compile eBPF kernel program (Clang)
+        run: |
+          clang -O2 -target bpf -c src/filter.bpf.c -o filter.bpf.o
+          ls -lh filter.bpf.o
+
       - name: Build vexond binary (musl static)
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
         run: |
           cargo build --release --target aarch64-unknown-linux-musl
-          cp target/aarch64-unknown-linux-musl/release/vexond ./vexond
 
-      - name: Attach binaries to latest release
+      - name: Prepare Release Assets & Checksums
+        run: |
+          mkdir -p release_dist
+          cp target/aarch64-unknown-linux-musl/release/vexond release_dist/vexond
+          cp filter.bpf.o release_dist/filter.bpf.o
+          
+          # Если model.bin или mlqos.nft есть в репозитории, копируем их, иначе создаем заглушки
+          if [ -f "model.bin" ]; then cp model.bin release_dist/; else head -c 1308 /dev/zero > release_dist/model.bin; fi
+          if [ -f "mlqos.nft" ]; then cp mlqos.nft release_dist/; elif [ -f "src/mlqos.nft" ]; then cp src/mlqos.nft release_dist/; fi
+
+          cd release_dist
+          sha256sum vexond > SHA256SUMS
+          sha256sum filter.bpf.o >> SHA256SUMS
+          [ -f "model.bin" ] && sha256sum model.bin >> SHA256SUMS
+          [ -f "mlqos.nft" ] && sha256sum mlqos.nft >> SHA256SUMS
+          
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS
+
+      - name: Publish to latest Release
         uses: softprops/action-gh-release@v2
-        if: github.ref == 'refs/heads/main'
         with:
           tag_name: latest
+          name: "Vexon Latest Build"
+          prerelease: false
           files: |
-            vexond
-            ebpf/filter.bpf.o
-            rules/mlqos.nft
+            release_dist/vexond
+            release_dist/filter.bpf.o
+            release_dist/model.bin
+            release_dist/mlqos.nft
+            release_dist/SHA256SUMS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
