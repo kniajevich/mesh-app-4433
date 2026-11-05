@@ -3,44 +3,38 @@
 #include <bpf/bpf_endian.h>
 
 #define TC_ACT_OK 0
-#define TC_ACT_SHOT 2
-
 #define ETH_P_IP 0x0800
-#define IPPROTO_TCP 6
-#define IPPROTO_UDP 17
+
+// Маска старшего байта skb->mark для изоляции от внутренних меток OpenWrt fw4
+#define QOS_MARK_MASK 0xFF000000
+#define QOS_MARK_SHIFT 24
 
 struct flow_key {
     __u32 src_ip;
     __u32 dst_ip;
     __u16 src_port;
     __u16 dst_port;
-    __u8  proto;
+    __u8  protocol;
 };
 
-struct flow_meta {
-    struct flow_key key;
-    __u32 pkt_len;
-    __u64 timestamp;
+struct flow_metrics {
+    __u8  class_id;
+    __u64 last_seen;
 };
-
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);
-} ringbuf SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 65536);
     __type(key, struct flow_key);
-    __type(value, __u8);
-} flow_classes SEC(".maps");
+    __type(value, struct flow_metrics);
+} flow_table SEC(".maps");
 
-SEC("tc")
-int tc_classifier(struct __sk_buff *skb)
-{
+SEC("classifier")
+int tc_classify(struct __sk_buff *skb) {
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
 
+    // Проверка заголовка Ethernet
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
         return TC_ACT_OK;
@@ -48,50 +42,45 @@ int tc_classifier(struct __sk_buff *skb)
     if (bpf_ntohs(eth->h_proto) != ETH_P_IP)
         return TC_ACT_OK;
 
+    // Проверка базового IPv4 заголовка
     struct iphdr *ip = (void *)(eth + 1);
     if ((void *)(ip + 1) > data_end)
         return TC_ACT_OK;
 
+    // Защита от malformed пакетов: IHL должна быть не менее 5 (20 байт)
     if (ip->ihl < 5)
         return TC_ACT_OK;
 
-    struct flow_key key = {};
+    struct flow_key key = {0};
     key.src_ip = ip->saddr;
     key.dst_ip = ip->daddr;
-    key.proto  = ip->protocol;
+    key.protocol = ip->protocol;
 
-    void *l4 = (void *)ip + (ip->ihl * 4);
-    if (l4 > data_end)
-        return TC_ACT_OK;
+    void *l4_hdr = (void *)ip + (ip->ihl * 4);
 
-    if (key.proto == IPPROTO_TCP) {
-        struct tcphdr *tcp = l4;
+    if (ip->protocol == IPPROTO_TCP) {
+        struct tcphdr *tcp = l4_hdr;
         if ((void *)(tcp + 1) > data_end)
             return TC_ACT_OK;
-        key.src_port = tcp->source;
-        key.dst_port = tcp->dest;
-    } else if (key.proto == IPPROTO_UDP) {
-        struct udphdr *udp = l4;
+        // Приведение сетевого порядка байт (Big-Endian) в Host-Endian
+        key.src_port = bpf_ntohs(tcp->source);
+        key.dst_port = bpf_ntohs(tcp->dest);
+    } else if (ip->protocol == IPPROTO_UDP) {
+        struct udphdr *udp = l4_hdr;
         if ((void *)(udp + 1) > data_end)
             return TC_ACT_OK;
-        key.src_port = udp->source;
-        key.dst_port = udp->dest;
+        // Приведение сетевого порядка байт (Big-Endian) в Host-Endian
+        key.src_port = bpf_ntohs(udp->source);
+        key.dst_port = bpf_ntohs(udp->dest);
     } else {
         return TC_ACT_OK;
     }
 
-    __u8 *dscp = bpf_map_lookup_elem(&flow_classes, &key);
-    if (dscp) {
-        skb->priority = *dscp;
-        return TC_ACT_OK;
-    }
-
-    struct flow_meta *meta = bpf_ringbuf_reserve(&ringbuf, sizeof(*meta), 0);
-    if (meta) {
-        meta->key = key;
-        meta->pkt_len = skb->len;
-        meta->timestamp = bpf_ktime_get_ns();
-        bpf_ringbuf_submit(meta, 0);
+    struct flow_metrics *metric = bpf_map_lookup_elem(&flow_table, &key);
+    if (metric) {
+        // Записываем класс QoS строго в старшие 8 бит skb->mark
+        __u32 current_mark = skb->mark & ~QOS_MARK_MASK;
+        skb->mark = current_mark | ((__u32)metric->class_id << QOS_MARK_SHIFT);
     }
 
     return TC_ACT_OK;
