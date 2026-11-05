@@ -1,24 +1,25 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use sha2::{Digest, Sha256};
 use tokio::time;
 
-// ============================================================================
-// 1. MLP INT8 Pure Rust Engine (Топология: 16 -> 32 -> 16 -> 4)
-// ============================================================================
-// Точный размер бинарника в байтах:
-// W1: 32 * 16 = 512
-// B1: 32 * 4  = 128
-// Scale1: 4
-// W2: 16 * 32 = 512
-// B2: 16 * 4  = 64
-// Scale2: 4
-// W3: 4 * 16  = 64
-// B3: 4 * 4   = 16
-// Scale3: 4
-// Итого: 512 + 128 + 4 + 512 + 64 + 4 + 64 + 16 + 4 = 1308 байт
 pub const MODEL_BIN_SIZE: usize = 1308;
+
+// Константа Золотого Сечения (Golden Ratio) ядра Linux для 32-битного Фибоначчиева хэширования
+pub const PHI_32: u32 = 0x9E3779B9;
+
+/// Фибоначчиево хэширование 5-tuple сетевого соединения в 1 такт CPU
+#[inline(always)]
+pub fn fibonacci_flow_hash(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, proto: u8) -> usize {
+    let ports = ((src_port as u32) << 16) | (dst_port as u32);
+    let mut h = src_ip.wrapping_mul(PHI_32);
+    h = (h ^ dst_ip).wrapping_mul(PHI_32);
+    h = (h ^ ports).wrapping_mul(PHI_32);
+    h = (h ^ (proto as u32)).wrapping_mul(PHI_32);
+    // Старшие 10 бит (размер таблицы 1024 бакета)
+    (h >> 22) as usize
+}
 
 #[derive(Clone, Debug)]
 pub struct Int8Mlp {
@@ -36,7 +37,6 @@ pub struct Int8Mlp {
 }
 
 impl Int8Mlp {
-    /// Загрузка весов из плоского бинарного буфера
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
         if bytes.len() != MODEL_BIN_SIZE {
             return Err("Invalid model.bin size: byte count mismatch");
@@ -104,7 +104,6 @@ impl Int8Mlp {
         })
     }
 
-    /// Безопасные дефолтные веса для холодного старта без сети
     pub fn fallback() -> Self {
         Self {
             w1: [[1i8; 16]; 32],
@@ -119,38 +118,40 @@ impl Int8Mlp {
         }
     }
 
-    /// Zero-allocation прямой проход: 16 признаков -> 4 логита классов QoS
+    /// Инференс с защитой от переполнения через насыщающую арифметику (saturating)
     #[inline(always)]
     pub fn forward(&self, input: &[i8; 16]) -> [i32; 4] {
-        // Слой 1: 16 -> 32 с активацией ReLU
+        // Слой 1: 16 -> 32 (ReLU)
         let mut l1_out = [0i8; 32];
         for i in 0..32 {
             let mut acc = self.b1[i];
             for j in 0..16 {
-                acc += (self.w1[i][j] as i32) * (input[j] as i32);
+                let prod = (self.w1[i][j] as i32).saturating_mul(input[j] as i32);
+                acc = acc.saturating_add(prod);
             }
-            // ReLU + реквантование в i8
             let val = acc.max(0);
             l1_out[i] = (val / 128).clamp(0, 127) as i8;
         }
 
-        // Слой 2: 32 -> 16 с активацией ReLU
+        // Слой 2: 32 -> 16 (ReLU)
         let mut l2_out = [0i8; 16];
         for i in 0..16 {
             let mut acc = self.b2[i];
             for j in 0..32 {
-                acc += (self.w2[i][j] as i32) * (l1_out[j] as i32);
+                let prod = (self.w2[i][j] as i32).saturating_mul(l1_out[j] as i32);
+                acc = acc.saturating_add(prod);
             }
             let val = acc.max(0);
             l2_out[i] = (val / 128).clamp(0, 127) as i8;
         }
 
-        // Слой 3: 16 -> 4 (Линейные выходные логиты без ReLU)
+        // Слой 3: 16 -> 4 (Линейные выходные логиты)
         let mut l3_out = [0i32; 4];
         for i in 0..4 {
             let mut acc = self.b3[i];
             for j in 0..16 {
-                acc += (self.w3[i][j] as i32) * (l2_out[j] as i32);
+                let prod = (self.w3[i][j] as i32).saturating_mul(l2_out[j] as i32);
+                acc = acc.saturating_add(prod);
             }
             l3_out[i] = acc;
         }
@@ -158,11 +159,6 @@ impl Int8Mlp {
         l3_out
     }
 
-    /// Возвращает индекс класса с наивысшим приоритетом:
-    /// 0: Gaming / EF
-    /// 1: Streaming / AF41
-    /// 2: Web / Best Effort
-    /// 3: Bulk / CS1
     #[inline(always)]
     pub fn classify(&self, input: &[i8; 16]) -> u8 {
         let logits = self.forward(input);
@@ -178,13 +174,7 @@ impl Int8Mlp {
     }
 }
 
-// ============================================================================
-// 2. Фоновый сервис безопасного обновления весов
-// ============================================================================
 async fn spawn_model_updater(active_model: Arc<ArcSwap<Int8Mlp>>, repo: String) {
-    let sha_url = format!("https://github.com/{}/releases/download/latest/model.sha256", repo);
-    let bin_url = format!("https://github.com/{}/releases/download/latest/model.bin", repo);
-
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .user_agent("smart-qosd-updater")
@@ -198,7 +188,11 @@ async fn spawn_model_updater(active_model: Arc<ArcSwap<Int8Mlp>>, repo: String) 
         loop {
             interval.tick().await;
 
-            // 1. Проверяем контрольную сумму
+            let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            // Cache-busting: исключаем отдачу устаревшего файла из CDN GitHub
+            let sha_url = format!("https://github.com/{}/releases/download/latest/model.sha256?t={}", repo, ts);
+            let bin_url = format!("https://github.com/{}/releases/download/latest/model.bin?t={}", repo, ts);
+
             let sha_resp = match client.get(&sha_url).send().await {
                 Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
                 _ => continue,
@@ -209,7 +203,6 @@ async fn spawn_model_updater(active_model: Arc<ArcSwap<Int8Mlp>>, repo: String) 
                 continue;
             }
 
-            // 2. Скачиваем бинарник весов
             let bin_resp = match client.get(&bin_url).send().await {
                 Ok(r) if r.status().is_success() => match r.bytes().await {
                     Ok(b) => b,
@@ -218,51 +211,44 @@ async fn spawn_model_updater(active_model: Arc<ArcSwap<Int8Mlp>>, repo: String) 
                 _ => continue,
             };
 
-            // 3. Строгая валидация размера (ровно 1308 байт)
             if bin_resp.len() != MODEL_BIN_SIZE {
-                eprintln!("[Model Update] Rejected: size mismatch (got {}, expected {})", bin_resp.len(), MODEL_BIN_SIZE);
+                eprintln!("[Model Update] Size mismatch: got {}, expected {}", bin_resp.len(), MODEL_BIN_SIZE);
                 continue;
             }
 
-            // 4. Проверка SHA256
             let mut hasher = Sha256::new();
             hasher.update(&bin_resp);
             let calculated_sha = format!("{:x}", hasher.finalize());
 
             if calculated_sha != remote_sha {
-                eprintln!("[Model Update] Rejected: SHA256 checksum mismatch");
+                eprintln!("[Model Update] SHA256 mismatch: calculated {}, expected {}", calculated_sha, remote_sha);
                 continue;
             }
 
-            // 5. Парсинг и атомарная подмена указателя в памяти
             if let Ok(new_mlp) = Int8Mlp::from_bytes(&bin_resp) {
                 active_model.store(Arc::new(new_mlp));
                 current_sha = remote_sha;
-                println!("[Model Update] Successfully applied new INT8 weights (SHA: {})", current_sha);
+                println!("[Model Update] Successfully applied new INT8 weights. SHA: {}", current_sha);
             }
         }
     });
 }
 
-// ============================================================================
-// 3. Точка входа демона
-// ============================================================================
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting smart-qosd with INT8 MLP classification engine...");
 
-    // Инициализация fallback-модели в памяти
     let initial_model = Arc::new(ArcSwap::from_pointee(Int8Mlp::fallback()));
-
-    // Запуск фонового автообновления
     spawn_model_updater(initial_model.clone(), "kniajevich/mesh-app-4433".to_string()).await;
 
-    // Демонстрационный проверочный прогон
+    // Проверка хэширования потока через константу Золотого Сечения
+    let sample_bucket = fibonacci_flow_hash(0xC0A80101, 0x08080808, 4433, 443, 6);
+    println!("Fibonacci Hash Engine initialized. Sample bucket: {}", sample_bucket);
+
     let sample_features: [i8; 16] = [40, 6, 2, 0, 15, 3, 12, 8, 0, 1, 4, 10, 0, 0, 5, 2];
     let class_id = initial_model.load().classify(&sample_features);
-    println!("Engine booted. Test classification verdict: class {}", class_id);
+    println!("Engine booted. Self-test prediction: Class {}", class_id);
 
-    // Главный цикл обработки событий eBPF
     tokio::signal::ctrl_c().await?;
     println!("Shutting down smart-qosd...");
     Ok(())
