@@ -12,8 +12,6 @@ use tokio::time;
 pub const MODEL_BIN_SIZE: usize = 1308;
 const REPO: &str = "kniajevich/vexon";
 const INSTALL_DIR: &str = "/opt/vexon";
-
-// Золотое сечение: 2^32 / phi (Fibonacci Multiplicative Constant)
 const PHI_32: u32 = 0x9E3779B9;
 
 #[repr(C)]
@@ -282,7 +280,6 @@ fn calculate_bytes_sha256(bytes: &[u8]) -> String {
 fn start_kernel_classifier(model: Arc<ArcSwap<Int8Mlp>>) {
     tokio::spawn(async move {
         let map_path = "/sys/fs/bpf/tc/globals/flow_table";
-        // Гармонический интервал опроса: 62 ms (~100 ms / phi)
         let mut interval = time::interval(Duration::from_millis(62));
         let mut map_fd = -1;
 
@@ -305,14 +302,11 @@ fn start_kernel_classifier(model: Arc<ArcSwap<Int8Mlp>>) {
                 if unsafe { bpf_map_lookup(map_fd, &next_key, &mut metric) } == 0 {
                     if metric.classified == 0 && metric.pkt_count >= 3 {
                         let mut features = [0i8; 16];
-                        
-                        // Нормализация длины пакета
                         features[0] = ((metric.last_len as i32 * 127) / 1500).clamp(-128, 127) as i8;
                         features[3] = next_key.protocol as i8;
-                        
-                        // Золотое сечение: Fibonacci hash для равномерной дисперсии признаков портов
+
                         let port_entropy = ((next_key.dst_port as u32 ^ (next_key.src_port as u32).rotate_left(8)).wrapping_mul(PHI_32)) >> 24;
-                        features[11] = (port_entropy as i8);
+                        features[11] = port_entropy as i8;
                         features[12] = ((next_key.dst_port as u32).wrapping_mul(PHI_32) >> 25) as i8;
 
                         let class = model.load().classify(&features);
@@ -360,7 +354,6 @@ async fn run_autonomous_updater(active_model: Arc<ArcSwap<Int8Mlp>>) {
                 }
             }
 
-            // 1. Проверяем обновление модели
             if let Some(remote_sha) = remote_hashes.get("model.bin") {
                 let local_sha = calculate_file_sha256(&format!("{}/model.bin", INSTALL_DIR)).unwrap_or_default();
                 if local_sha != *remote_sha {
@@ -381,7 +374,6 @@ async fn run_autonomous_updater(active_model: Arc<ArcSwap<Int8Mlp>>) {
                 }
             }
 
-            // 2. Проверяем обновление eBPF-байткода
             if let Some(remote_sha) = remote_hashes.get("filter.bpf.o") {
                 let local_sha = calculate_file_sha256(&format!("{}/filter.bpf.o", INSTALL_DIR)).unwrap_or_default();
                 if local_sha != *remote_sha {
@@ -409,7 +401,6 @@ async fn run_autonomous_updater(active_model: Arc<ArcSwap<Int8Mlp>>) {
                 }
             }
 
-            // 3. Проверяем обновление vexond
             if let Some(remote_sha) = remote_hashes.get("vexond") {
                 let local_sha = calculate_file_sha256(&format!("{}/vexond", INSTALL_DIR)).unwrap_or_default();
                 if local_sha != *remote_sha {
