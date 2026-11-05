@@ -270,6 +270,12 @@ fn calculate_file_sha256(path: &str) -> Option<String> {
     Some(format!("{:x}", hasher.finalize()))
 }
 
+fn calculate_bytes_sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
 fn start_kernel_classifier(model: Arc<ArcSwap<Int8Mlp>>) {
     tokio::spawn(async move {
         let map_path = "/sys/fs/bpf/tc/globals/flow_table";
@@ -322,7 +328,6 @@ async fn run_autonomous_updater(active_model: Arc<ArcSwap<Int8Mlp>>) {
         .build()
         .unwrap_or_default();
 
-    // Проверяем обновления каждые 4 часа
     let mut interval = time::interval(Duration::from_secs(4 * 3600));
 
     tokio::spawn(async move {
@@ -346,65 +351,75 @@ async fn run_autonomous_updater(active_model: Arc<ArcSwap<Int8Mlp>>) {
                 }
             }
 
-            // 1. Проверяем обновление модели
+            // 1. Проверяем обновление модели с валидацией SHA256
             if let Some(remote_sha) = remote_hashes.get("model.bin") {
                 let local_sha = calculate_file_sha256(&format!("{}/model.bin", INSTALL_DIR)).unwrap_or_default();
                 if local_sha != *remote_sha {
                     let bin_url = format!("https://github.com/{}/releases/download/latest/model.bin?t={}", REPO, ts);
                     if let Ok(b_res) = client.get(&bin_url).send().await {
                         if let Ok(bytes) = b_res.bytes().await {
-                            if bytes.len() == MODEL_BIN_SIZE {
+                            if bytes.len() == MODEL_BIN_SIZE && calculate_bytes_sha256(&bytes) == *remote_sha {
                                 if let Ok(new_mlp) = Int8Mlp::from_bytes(&bytes) {
                                     let _ = fs::write(format!("{}/model.bin", INSTALL_DIR), &bytes);
                                     active_model.store(Arc::new(new_mlp));
-                                    println!("[AutoUpdater] Model weights updated to {}", remote_sha);
+                                    println!("[AutoUpdater] Model weights verified and updated to {}", remote_sha);
                                 }
+                            } else {
+                                eprintln!("[AutoUpdater] Corrupted model.bin payload downloaded. Skipping.");
                             }
                         }
                     }
                 }
             }
 
-            // 2. Проверяем обновление eBPF-байткода (filter.bpf.o)
+            // 2. Проверяем обновление eBPF-байткода с валидацией SHA256
             if let Some(remote_sha) = remote_hashes.get("filter.bpf.o") {
                 let local_sha = calculate_file_sha256(&format!("{}/filter.bpf.o", INSTALL_DIR)).unwrap_or_default();
                 if local_sha != *remote_sha {
                     let bpf_url = format!("https://github.com/{}/releases/download/latest/filter.bpf.o?t={}", REPO, ts);
                     if let Ok(b_res) = client.get(&bpf_url).send().await {
                         if let Ok(bytes) = b_res.bytes().await {
-                            let target_path = format!("{}/filter.bpf.o", INSTALL_DIR);
-                            let tmp_path = format!("{}/filter.bpf.o.tmp", INSTALL_DIR);
-                            if fs::write(&tmp_path, &bytes).is_ok() && fs::rename(&tmp_path, &target_path).is_ok() {
-                                println!("[AutoUpdater] Hot-reloading eBPF filters on br-lan...");
-                                let _ = Command::new("tc")
-                                    .args(["filter", "replace", "dev", "br-lan", "ingress", "bpf", "da", "obj", &target_path, "sec", "classifier"])
-                                    .status();
-                                let _ = Command::new("tc")
-                                    .args(["filter", "replace", "dev", "br-lan", "egress", "bpf", "da", "obj", &target_path, "sec", "classifier"])
-                                    .status();
-                                println!("[AutoUpdater] eBPF bytecode updated successfully.");
+                            if calculate_bytes_sha256(&bytes) == *remote_sha {
+                                let target_path = format!("{}/filter.bpf.o", INSTALL_DIR);
+                                let tmp_path = format!("{}/filter.bpf.o.tmp", INSTALL_DIR);
+                                if fs::write(&tmp_path, &bytes).is_ok() && fs::rename(&tmp_path, &target_path).is_ok() {
+                                    println!("[AutoUpdater] Hot-reloading eBPF filters on br-lan...");
+                                    let _ = Command::new("tc")
+                                        .args(["filter", "replace", "dev", "br-lan", "ingress", "bpf", "da", "obj", &target_path, "sec", "classifier"])
+                                        .status();
+                                    let _ = Command::new("tc")
+                                        .args(["filter", "replace", "dev", "br-lan", "egress", "bpf", "da", "obj", &target_path, "sec", "classifier"])
+                                        .status();
+                                    println!("[AutoUpdater] eBPF bytecode updated and verified successfully.");
+                                }
+                            } else {
+                                eprintln!("[AutoUpdater] Corrupted filter.bpf.o payload downloaded. Skipping.");
                             }
                         }
                     }
                 }
             }
 
-            // 3. Проверяем обновление самого бинарника (vexond)
+            // 3. Проверяем обновление самого демона с валидацией SHA256 (защита от bricking)
             if let Some(remote_sha) = remote_hashes.get("vexond") {
                 let local_sha = calculate_file_sha256(&format!("{}/vexond", INSTALL_DIR)).unwrap_or_default();
                 if local_sha != *remote_sha {
                     let bin_url = format!("https://github.com/{}/releases/download/latest/vexond?t={}", REPO, ts);
                     if let Ok(b_res) = client.get(&bin_url).send().await {
                         if let Ok(bytes) = b_res.bytes().await {
-                            let tmp_bin = format!("{}/vexond.tmp", INSTALL_DIR);
-                            let target_bin = format!("{}/vexond", INSTALL_DIR);
-                            if fs::write(&tmp_bin, &bytes).is_ok() {
-                                let _ = fs::set_permissions(&tmp_bin, fs::Permissions::from_mode(0o755));
-                                if fs::rename(&tmp_bin, &target_bin).is_ok() {
-                                    println!("[AutoUpdater] New vexond binary installed. Restarting via procd...");
-                                    // Выход из процесса: procd автоматически перезапустит обновленный бинарник
-                                    exit(0);
+                            let downloaded_sha = calculate_bytes_sha256(&bytes);
+                            if downloaded_sha == *remote_sha {
+                                let tmp_bin = format!("{}/vexond.tmp", INSTALL_DIR);
+                                let target_bin = format!("{}/vexond", INSTALL_DIR);
+                                if fs::write(&tmp_bin, &bytes).is_ok() {
+                                    let _ = fs::set_permissions(&tmp_bin, fs::Permissions::from_mode(0o755));
+                                    if fs::rename(&tmp_bin, &target_bin).is_ok() {
+                                        println!("[AutoUpdater] Verified new vexond binary installed. Restarting via procd...");
+                                        exit(0);
+                                    }
                                 }
+                            } else {
+                                eprintln!("[AutoUpdater] Corrupted vexond payload downloaded. Aborting update.");
                             }
                         }
                     }
