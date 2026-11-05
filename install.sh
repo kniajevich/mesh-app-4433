@@ -3,10 +3,11 @@ set -e
 
 HUB_URL="https://vexon-cloud.goldman-ao.workers.dev"
 REPO_RAW="https://raw.githubusercontent.com/kniajevich/vexon/main"
+GITHUB_API="https://api.github.com/repos/kniajevich/vexon/commits/main"
 INSTALL_DIR="/opt/vexon"
 SERVICE_FILE="/etc/init.d/vexon"
 
-echo "[VEXON] Installing Autonomous Edge Agent with Telemetry & Update Reporter..."
+echo "[VEXON] Installing Autonomous Edge Agent with Detailed GitHub Commit Reporter..."
 mkdir -p "$INSTALL_DIR"
 
 cat << 'EOF' > "${INSTALL_DIR}/sync_agent.sh"
@@ -14,6 +15,7 @@ cat << 'EOF' > "${INSTALL_DIR}/sync_agent.sh"
 
 HUB_URL="${VEXON_HUB_URL:-https://vexon-cloud.goldman-ao.workers.dev}"
 REPO_RAW="https://raw.githubusercontent.com/kniajevich/vexon/main"
+GITHUB_API="https://api.github.com/repos/kniajevich/vexon/commits/main"
 NODE_ID="${VEXON_NODE_ID:-$(cat /proc/sys/kernel/hostname 2>/dev/null || hostname 2>/dev/null || echo "edge-node")}"
 
 NORMAL_INTERVAL=14400
@@ -42,11 +44,10 @@ collect_metrics() {
 
     KERNEL_VER=$(uname -r 2>/dev/null || echo "unknown")
 
-    # Считываем информацию о последнем апдейте
     if [ -f "$UPDATE_LOG_FILE" ]; then
         UPDATE_INFO=$(cat "$UPDATE_LOG_FILE" 2>/dev/null || echo "{}")
     else
-        UPDATE_INFO="{\"version\":\"initial\",\"applied_at\":\"$(date -u +'%Y-%m-%dT%H:%M:%SZ')\",\"status\":\"base-install\",\"details\":\"Installed via bootstrap\"}"
+        UPDATE_INFO="{\"version\":\"initial\",\"applied_at\":\"$(date -u +'%Y-%m-%dT%H:%M:%SZ')\",\"status\":\"OK\",\"commit_msg\":\"Base system deployed\",\"target\":\"/opt/vexon/sync_agent.sh\"}"
     fi
 
     PAYLOAD="{\"node_id\": \"$NODE_ID\", \"hostname\": \"$NODE_ID\", \"status\": \"online\", \"timestamp\": $(date +%s), \"uptime\": $UPTIME_SEC, \"cpu_load\": \"$CPU_LOAD\", \"mem_pct\": $MEM_PCT, \"mem_free_mb\": $MEM_FREE_MB, \"mem_total_mb\": $MEM_TOTAL_MB, \"kernel\": \"$KERNEL_VER\", \"update_report\": $UPDATE_INFO}"
@@ -65,23 +66,34 @@ sync_topology() {
 
 check_self_update() {
     TMP_INSTALL="/tmp/vexon_install_latest.sh"
+    TMP_GH="/tmp/vexon_gh_commit.json"
+    
     if curl -m 15 --connect-timeout 5 -s -k "${REPO_RAW}/install.sh?v=$(date +%s)" -o "$TMP_INSTALL"; then
         if head -n 1 "$TMP_INSTALL" 2>/dev/null | grep -q '#!/bin/sh'; then
-            NEW_HASH=$(sha256sum "$TMP_INSTALL" 2>/dev/null | awk '{print substr($1,1,10)}' || echo "updated")
+            NEW_HASH=$(sha256sum "$TMP_INSTALL" 2>/dev/null | awk '{print substr($1,1,10)}' || echo "latest")
             CUR_HASH=$(cat /opt/vexon/current_version 2>/dev/null || echo "none")
 
             if [ "$NEW_HASH" != "$CUR_HASH" ]; then
                 echo "$NEW_HASH" > /opt/vexon/current_version
                 APPLIED_TIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
-                
+
+                # Стягиваем детали коммита с GitHub
+                COMMIT_MSG="OTA Patch applied"
+                curl -m 10 -s -k -H "User-Agent: Vexon-Edge-Agent" "$GITHUB_API" -o "$TMP_GH" 2>/dev/null || true
+                if [ -f "$TMP_GH" ]; then
+                    PARSED_MSG=$(grep -o '"message": "[^"]*' "$TMP_GH" | head -n 1 | cut -d'"' -f4 | sed 's/\\n/ /g' | cut -c 1-80)
+                    [ -n "$PARSED_MSG" ] && COMMIT_MSG="$PARSED_MSG"
+                    rm -f "$TMP_GH"
+                fi
+
                 cat << UPDATE_JSON > "$UPDATE_LOG_FILE"
 {
   "version": "$NEW_HASH",
   "applied_at": "$APPLIED_TIME",
-  "status": "success",
-  "package": "kniajevich/vexon@main",
-  "target": "/opt/vexon/sync_agent.sh",
-  "details": "OTA Hotpatch synced and applied via procd"
+  "status": "SUCCESS",
+  "commit_msg": "$COMMIT_MSG",
+  "source": "kniajevich/vexon@main",
+  "target": "/opt/vexon/sync_agent.sh"
 }
 UPDATE_JSON
 
@@ -137,4 +149,4 @@ chmod +x "$SERVICE_FILE"
 "$SERVICE_FILE" enable
 "$SERVICE_FILE" restart
 
-echo "[VEXON] Agent operational with OTA Update Telemetry!"
+echo "[VEXON] Agent operational with Extended Commit Reporter!"
