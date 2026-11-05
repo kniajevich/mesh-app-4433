@@ -1,0 +1,36 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=95
+STOP=10
+
+PROG=/opt/vexon/vexond
+BPF_OBJ=/opt/vexon/filter.bpf.o
+IFACE="br-lan"
+
+start_service() {
+    # 1. Монтируем bpf filesystem если не смонтирована
+    [ -d /sys/fs/bpf ] || mount -t bpf bpf /sys/fs/bpf
+
+    # 2. Применяем правила nftables
+    [ -f /opt/vexon/mlqos.nft ] && nft -f /opt/vexon/mlqos.nft
+
+    # 3. Привязываем eBPF фильтр к интерфейсу через tc
+    tc qdisc del dev "$IFACE" clsact 2>/dev/null
+    tc qdisc add dev "$IFACE" clsact 2>/dev/null
+    tc filter add dev "$IFACE" ingress bpf da obj "$BPF_OBJ" sec classifier 2>/dev/null
+    tc filter add dev "$IFACE" egress bpf da obj "$BPF_OBJ" sec classifier 2>/dev/null
+
+    # 4. Запуск демона под управлением procd
+    procd_open_instance
+    procd_set_param command "$PROG"
+    procd_set_param respawn 3600 5 0
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
+stop_service() {
+    tc qdisc del dev "$IFACE" clsact 2>/dev/null
+    killall vexond 2>/dev/null
+}
