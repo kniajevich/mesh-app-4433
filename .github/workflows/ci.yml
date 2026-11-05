@@ -16,30 +16,26 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install dependencies and cross-compilers
+      - name: Install eBPF dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libelf-dev libbpf-dev linux-tools-generic linux-headers-generic gcc-aarch64-linux-gnu musl-tools
+          sudo apt-get install -y clang llvm libelf-dev libbpf-dev linux-tools-generic linux-headers-generic
 
-      - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-musl
+      - name: Install Cross for Rust
+        run: |
+          cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Ensure headers and Compile eBPF
         run: |
-          # 1. Генерируем vmlinux.h, если его нет в репозитории
           if [ ! -f "vmlinux.h" ] && [ ! -f "bpf/vmlinux.h" ]; then
             echo "[*] Generating vmlinux.h via bpftool..."
             sudo bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h 2>/dev/null || true
           fi
 
-          # 2. Находим filter.bpf.c
           BPF_SRC=$(find . -name "filter.bpf.c" | head -n 1)
           BPF_DIR=$(dirname "$BPF_SRC")
           echo "Found BPF source at: $BPF_SRC"
 
-          # 3. Компилируем со всеми путями заголовков (включая libbpf)
           clang -O2 -target bpf \
             -D__TARGET_ARCH_arm64 \
             -I . \
@@ -51,9 +47,9 @@ jobs:
 
           ls -lh filter.bpf.o
 
-      - name: Build vexond binary (musl static)
+      - name: Build vexond binary via Cross
         run: |
-          cargo build --release --target aarch64-unknown-linux-musl
+          cross build --release --target aarch64-unknown-linux-musl
 
       - name: Prepare Release Assets & Checksums
         run: |
