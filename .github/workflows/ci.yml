@@ -28,19 +28,10 @@ jobs:
 
       - name: Compile eBPF kernel program (Clang)
         run: |
-          BPF_SRC=""
-          if [ -f "filter.bpf.c" ]; then
-            BPF_SRC="filter.bpf.c"
-          elif [ -f "src/filter.bpf.c" ]; then
-            BPF_SRC="src/filter.bpf.c"
-          elif [ -f "bpf/filter.bpf.c" ]; then
-            BPF_SRC="bpf/filter.bpf.c"
-          else
-            BPF_SRC=$(find . -name "filter.bpf.c" | head -n 1)
-          fi
-          
-          echo "Found BPF source at: $BPF_SRC"
-          clang -O2 -target bpf -c "$BPF_SRC" -o filter.bpf.o
+          BPF_SRC=$(find . -name "filter.bpf.c" | head -n 1)
+          BPF_DIR=$(dirname "$BPF_SRC")
+          echo "Compiling $BPF_SRC with include dir $BPF_DIR..."
+          clang -O2 -target bpf -I "$BPF_DIR" -I . -c "$BPF_SRC" -o filter.bpf.o
           ls -lh filter.bpf.o
 
       - name: Build vexond binary (musl static)
@@ -53,9 +44,18 @@ jobs:
           cp target/aarch64-unknown-linux-musl/release/vexond release_dist/vexond
           cp filter.bpf.o release_dist/filter.bpf.o
           
-          # Копируем model.bin и mlqos.nft, если есть, иначе генерируем
-          if [ -f "model.bin" ]; then cp model.bin release_dist/; else head -c 1308 /dev/zero > release_dist/model.bin; fi
-          if [ -f "mlqos.nft" ]; then cp mlqos.nft release_dist/; elif [ -f "src/mlqos.nft" ]; then cp src/mlqos.nft release_dist/; fi
+          # Копируем model.bin и mlqos.nft, если есть, иначе создаем валидные заглушки
+          if [ -f "model.bin" ]; then 
+            cp model.bin release_dist/
+          else 
+            head -c 1308 /dev/zero > release_dist/model.bin
+          fi
+
+          if [ -f "mlqos.nft" ]; then 
+            cp mlqos.nft release_dist/
+          elif [ -f "src/mlqos.nft" ]; then 
+            cp src/mlqos.nft release_dist/
+          fi
 
           cd release_dist
           sha256sum vexond > SHA256SUMS
