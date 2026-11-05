@@ -4,6 +4,7 @@
 
 #define TC_ACT_OK 0
 #define ETH_P_IP 0x0800
+#define PHI_32 0x9E3779B9U
 
 struct flow_key {
     __u32 src_ip;
@@ -22,7 +23,6 @@ struct flow_metrics {
     __u64 last_time;
 };
 
-// Заменено на LRU_HASH: ядро автоматически вытесняет неактивные сессии при 65k+ соединений
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
