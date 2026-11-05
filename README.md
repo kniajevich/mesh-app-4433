@@ -56,6 +56,8 @@ Run the autonomous installer directly on your router:
 
 ---
 
-### License
 
-Licensed under MIT / eBPF kernel program licensed under GPL.
+## License
+
+- **Control Plane (`vexond`) & Models:** Licensed under **PolyForm Noncommercial License 1.0.0**. Free for personal and non-commercial use. Commercial use, resale, or embedding into proprietary commercial appliances is strictly prohibited without explicit written consent or a commercial license agreement from the author.
+- **Data Plane (`filter.bpf.o`):** Licensed under **GPL-2.0** as required by Linux eBPF subsystem.
