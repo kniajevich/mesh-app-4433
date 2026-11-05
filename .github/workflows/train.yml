@@ -1,40 +1,97 @@
-name: Train & Release INT8 QoS Model
+name: OpenWrt eBPF & Rust aarch64-musl CI
 
 on:
-  schedule:
-    - cron: '0 3 * * *'
+  push:
+    branches: [ "main" ]
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  train-and-release:
+  build:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install PyTorch CPU & NumPy
+      - name: Install dependencies and cross-compilers
         run: |
-          pip install --upgrade pip
-          pip install numpy torch --index-url https://download.pytorch.org/whl/cpu
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev linux-tools-generic linux-headers-generic gcc-aarch64-linux-gnu musl-tools
 
-      - name: Execute Autonomous MLOps Pipeline
-        run: python train/train.py
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
 
-      - name: Publish Trained Model to Latest Release
+      - name: Ensure vmlinux.h and Compile eBPF
+        run: |
+          # 1. Ищем существующий vmlinux.h или генерируем из BTF ядра
+          if [ ! -f "vmlinux.h" ] && [ ! -f "bpf/vmlinux.h" ]; then
+            echo "[*] Generating vmlinux.h via bpftool..."
+            sudo bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h 2>/dev/null || true
+          fi
+
+          # 2. Находим путь к filter.bpf.c
+          BPF_SRC=$(find . -name "filter.bpf.c" | head -n 1)
+          BPF_DIR=$(dirname "$BPF_SRC")
+          echo "Found BPF source at: $BPF_SRC"
+
+          # 3. Собираем все возможные директории инклудов
+          INCLUDE_DIRS="-I . -I $BPF_DIR"
+          VMLINUX_LOC=$(find . -name "vmlinux.h" | head -n 1)
+          if [ -n "$VMLINUX_LOC" ]; then
+            INCLUDE_DIRS="$INCLUDE_DIRS -I $(dirname "$VMLINUX_LOC")"
+          fi
+
+          echo "Compiling with flags: $INCLUDE_DIRS"
+          clang -O2 -target bpf $INCLUDE_DIRS -c "$BPF_SRC" -o filter.bpf.o
+          ls -lh filter.bpf.o
+
+      - name: Build vexond binary (musl static)
+        run: |
+          cargo build --release --target aarch64-unknown-linux-musl
+
+      - name: Prepare Release Assets & Checksums
+        run: |
+          mkdir -p release_dist
+          cp target/aarch64-unknown-linux-musl/release/vexond release_dist/vexond
+          cp filter.bpf.o release_dist/filter.bpf.o
+          
+          if [ -f "model.bin" ]; then 
+            cp model.bin release_dist/
+          else 
+            head -c 1308 /dev/zero > release_dist/model.bin
+          fi
+
+          if [ -f "mlqos.nft" ]; then 
+            cp mlqos.nft release_dist/
+          elif [ -f "src/mlqos.nft" ]; then 
+            cp src/mlqos.nft release_dist/
+          fi
+
+          cd release_dist
+          sha256sum vexond > SHA256SUMS
+          sha256sum filter.bpf.o >> SHA256SUMS
+          [ -f "model.bin" ] && sha256sum model.bin >> SHA256SUMS
+          [ -f "mlqos.nft" ] && sha256sum mlqos.nft >> SHA256SUMS
+          
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS
+
+      - name: Publish to latest Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: "Latest Autonomous INT8 Model Weights"
-          body: "Daily retrained INT8 weights dynamically tuned via Cloudflare Radar telemetry."
+          name: "Vexon Latest Build"
+          prerelease: false
           files: |
-            model.bin
-            model.sha256
+            release_dist/vexond
+            release_dist/filter.bpf.o
+            release_dist/model.bin
+            release_dist/mlqos.nft
+            release_dist/SHA256SUMS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
